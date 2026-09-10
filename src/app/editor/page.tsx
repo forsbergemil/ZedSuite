@@ -5030,41 +5030,31 @@ function EditorPageContent() {
           console.error("version extra maps read failed", e);
         }
 
-        // If this is an imported version, detect differences from original file
-        // This ensures maps modified in the imported file are shown in red
+        // If this version was created by importing a file, capture its FULL
+        // byte-level diff from the ORIGINAL as binary modifications, so the
+        // changes are shown in the hexdump, counted, saved into a new version,
+        // and exported. Every differing byte is recorded — not just the ones
+        // inside a detected map — which is what makes this work on families with
+        // NO trusted maps (EDC17 and other beta/unknown files): their
+        // detected-map list is empty, so the old map-only diff dropped the whole
+        // imported delta and a new version saved from it came out empty.
+        //
+        // These go into binaryModifications (not allMapModifications) on purpose:
+        // a new version does not copy the base version's on-disk binary, it is
+        // reconstructed from original + saved edits, and only binary edits are
+        // persisted for arbitrary byte offsets (map-cell edits are keyed by
+        // row/col, not by file offset). The map viewer still shows these cells
+        // against stock via its originalFileData/stockValues path.
         if (importedFileData && originalFileDataRef.current) {
           const originalData = originalFileDataRef.current;
-
-          // Get the current project data to access maps
-          // We need to use a different approach since we're in a callback
-          const maps = projectData?.detectionResults?.maps || [];
-
-          for (const map of maps) {
-            const mapAddress = map.address;
-            const mapSize = map.size;
-
-            if (mapAddress >= 0 && mapAddress + mapSize <= importedFileData.length && mapAddress + mapSize <= originalData.length) {
-              // Compare map data between original and imported file
-              let hasChanges = false;
-              const modifications: Record<string, number> = {};
-
-              for (let i = 0; i < mapSize; i++) {
-                const originalByte = originalData[mapAddress + i];
-                const importedByte = importedFileData[mapAddress + i];
-
-                if (originalByte !== importedByte) {
-                  hasChanges = true;
-                  // Store the modification (offset within map -> new value)
-                  modifications[i.toString()] = importedByte;
-                }
-              }
-
-              if (hasChanges) {
-                modificationsMap.set(mapAddress, modifications);
-              }
+          const compareLen = Math.min(importedFileData.length, originalData.length);
+          for (let addr = 0; addr < compareLen; addr++) {
+            const originalByte = originalData[addr];
+            const importedByte = importedFileData[addr];
+            if (originalByte !== importedByte) {
+              loadedBinaryModifications.set(addr, { oldValue: originalByte, newValue: importedByte });
             }
           }
-
         }
 
         setAllMapModifications(modificationsMap);
