@@ -286,15 +286,28 @@ export async function handleLocalApi(
         ecuType: fileRecord.ecu_type || undefined,
       });
 
+      // Preserve user-created maps and heuristic candidates across a re-detect:
+      // they are NOT produced by detection, so a straight overwrite would erase
+      // them from disk. Carry them over from the stored detection_data.
+      let prevDet: any = null;
+      try {
+        prevDet = typeof fileRecord.detection_data === "string"
+          ? JSON.parse(fileRecord.detection_data)
+          : fileRecord.detection_data;
+      } catch { /* corrupt/absent → nothing to preserve */ }
+      const merged: any = { ...results };
+      if (prevDet?.my_maps?.length) merged.my_maps = prevDet.my_maps;
+      if (prevDet?.potential_maps?.length) merged.potential_maps = prevDet.potential_maps;
+
       await store.updateFile(match[1], {
-        detection_data: results,
-        maps_detected: results.total_maps || 0,
+        detection_data: merged,
+        maps_detected: merged.total_maps || 0,
       });
 
       return ok({
         success: true,
-        detectionResults: results,
-        message: `Re-détection terminée: ${results.total_maps} maps trouvées`,
+        detectionResults: merged,
+        message: `Re-détection terminée: ${merged.total_maps} maps trouvées`,
       });
     }
 

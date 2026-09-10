@@ -4873,7 +4873,14 @@ function EditorPageContent() {
         const refreshed = stripSoiTag(response.data.detectionResults);
         setProjectData((prev) => {
           if (!prev || prev.fileId !== fileId) return prev;
-          const updated = { ...prev, detectionResults: refreshed };
+          // Keep user-created maps and heuristic candidates across a re-detect —
+          // detection never produces them, so fall back to the ones we had.
+          const merged = {
+            ...refreshed,
+            my_maps: refreshed?.my_maps ?? prev.detectionResults?.my_maps,
+            potential_maps: refreshed?.potential_maps ?? prev.detectionResults?.potential_maps,
+          };
+          const updated = { ...prev, detectionResults: merged };
           saveProjectToSession(updated);
           return updated;
         });
