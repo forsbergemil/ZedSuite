@@ -10,6 +10,8 @@ Drop in an ECU dump and ZedSuite finds the maps for you — Driver Wish, Turbo B
 
 No account, no cloud, no limits: everything runs locally and your files stay on your computer.
 
+> **Community fork — General File Editor (ongoing beta).** This fork adds a general file-editor layer on top of ZedSuite: a family-agnostic *potential maps* scanner for files the strict identifier rejects (with beta BMW/PSA **EDC17** import and a **Re-scan map area** button), user-created *My Maps*, reusable custom *Solutions*, a much richer editable hexdump (drag-select, bulk edit, copy/paste, ±step, zoom, configurable columns, per-project view settings), and an expanded Compare window. It is an ongoing beta — usable day to day, with a few small bugs — growing toward a full file editor. Everything stays local, and heuristic or user-created data is kept **separate** from the trusted per-family detection so nothing can pass as a verified map. Full list, and what's planned next, in the [fork roadmap](ROADMAP.md#shipped-so-far-ongoing-beta).
+
 ![ZedSuite editor](docs/screenshot.png)
 
 ## 🚗 Supported ECUs
