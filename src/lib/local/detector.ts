@@ -99,6 +99,29 @@ export async function scanPotentialMaps(args: {
   });
 }
 
+/**
+ * Re-scan for candidate tables restricted to the ECU's MAP area only.
+ * Same heuristic as scanPotentialMaps, but the Rust side skips the leading
+ * program/code region and the trailing flash-fill and scans only the
+ * calibration/data region in between (see generic::map_area_for). Pass the
+ * project's ecuType so the family map-area rule applies — "EDC17C" is the first
+ * family with a rule; an unknown family scans from the start (fill trimmed).
+ */
+export async function scanPotentialMapsInArea(args: {
+  fileDataBase64: string;
+  fileName: string;
+  ecuType?: string;
+}): Promise<DetectionResults> {
+  return invoke<DetectionResults>("scan_potential_maps_in_area", {
+    request: {
+      file_data_base64: args.fileDataBase64,
+      file_name: args.fileName,
+      ecu_type: args.ecuType,
+      tuned_mode: false,
+    },
+  });
+}
+
 export async function listEcus(): Promise<{ ecus: any[]; total: number; version: string }> {
   return invoke("list_ecus");
 }

@@ -183,11 +183,14 @@ struct ScanCtx {
     max_val: u32,
     data_type: DataType,
     width: Width,
+    /// Byte offset of `words[0]` within the original file, so addresses come out
+    /// absolute even when only a sub-range of the file is scanned.
+    base: u32,
 }
 
 impl ScanCtx {
     fn addr(&self, word_index: usize) -> u32 {
-        (word_index * self.stride) as u32
+        self.base + (word_index * self.stride) as u32
     }
 
     /// Try to read a candidate table whose Y axis starts at word index `w`.
@@ -350,13 +353,14 @@ impl ScanCtx {
     }
 }
 
-fn make_ctx(data: &[u8], endian: Endian, width: Width) -> ScanCtx {
+fn make_ctx(data: &[u8], endian: Endian, width: Width, base: u32) -> ScanCtx {
     ScanCtx {
         words: read_words(data, endian, width),
         stride: width.stride(),
         max_val: width.max_val(),
         data_type: width.data_type(),
         width,
+        base,
     }
 }
 
@@ -382,12 +386,69 @@ fn spans_overlap(a: (u32, u32), b: (u32, u32)) -> bool {
 /// 2. Make an 8-bit pass in that same byte order and add candidates that do not
 ///    overlap the 16-bit ones, up to the global cap.
 pub fn scan_potential_maps(data: &[u8]) -> Vec<DetectedMap> {
+    scan_slice(data, 0)
+}
+
+/// Scan only the byte range `[start, end)` of `data`, returning candidates with
+/// absolute (whole-file) addresses. Used by the "re-scan the map area" button so
+/// the leading code region and trailing flash-fill can be skipped -- see
+/// [`map_area_for`]. `start`/`end` are clamped to the file and to each other.
+pub fn scan_potential_maps_in_range(data: &[u8], start: usize, end: usize) -> Vec<DetectedMap> {
+    let start = start.min(data.len());
+    let end = end.min(data.len()).max(start);
+    log::warn!(
+        "🔎 [generic-scan] map-area range 0x{:X}..0x{:X} ({} of {} bytes)",
+        start,
+        end,
+        end - start,
+        data.len()
+    );
+    scan_slice(&data[start..end], start as u32)
+}
+
+/// Length of the file with its trailing flash-fill removed: the run of identical
+/// 0x00 / 0xFF bytes at the very end. Returns the index one past the last
+/// meaningful byte. A short trailing run of 0/0xFF is NOT treated as fill (a real
+/// map can simply end on such a value), so only a substantial pad is trimmed.
+fn trim_trailing_fill(data: &[u8]) -> usize {
+    let n = data.len();
+    let mut end = n;
+    while end > 0 && (data[end - 1] == 0xFF || data[end - 1] == 0x00) {
+        end -= 1;
+    }
+    if n - end >= 256 {
+        end
+    } else {
+        n
+    }
+}
+
+/// Resolve the `[start, end)` byte range that holds the calibration / MAP area
+/// for a given ECU family, per the "skip the code region, scan the rest"
+/// heuristic: skip a leading program/code region and stop before the trailing
+/// flash-fill. Family unknown -> scan from the start (fill still trimmed).
+///
+/// `ecu_type` is the frontend family string (e.g. "EDC17C"). For the BMW/PSA
+/// EDC17 family the OS/code occupies the low half of the flash and the
+/// calibration data & maps live in the upper region (real EDC17C50 maps begin
+/// around 0x100000 on a 2 MB dump), so the low half is skipped.
+pub fn map_area_for(ecu_type: &str, data: &[u8]) -> (usize, usize) {
+    let end = trim_trailing_fill(data);
+    let start = match ecu_type {
+        "EDC17C" | "EDC17" => data.len() / 2,
+        _ => 0,
+    };
+    (start.min(end), end)
+}
+
+/// Core scan over a byte slice whose first byte sits at absolute offset `base`.
+fn scan_slice(data: &[u8], base: u32) -> Vec<DetectedMap> {
     if data.len() < 64 {
         return Vec::new();
     }
 
-    let be16 = make_ctx(data, Endian::Big, Width::Bits16).scan();
-    let le16 = make_ctx(data, Endian::Little, Width::Bits16).scan();
+    let be16 = make_ctx(data, Endian::Big, Width::Bits16, base).scan();
+    let le16 = make_ctx(data, Endian::Little, Width::Bits16, base).scan();
     let (chosen_endian, mut out) = if le16.len() > be16.len() {
         (Endian::Little, le16)
     } else {
@@ -399,7 +460,7 @@ pub fn scan_potential_maps(data: &[u8]) -> Vec<DetectedMap> {
     // budget with regions the 16-bit pass did not already cover.
     if out.len() < MAX_CANDIDATES {
         let mut ranges: Vec<(u32, u32)> = out.iter().map(map_span).collect();
-        for m in make_ctx(data, chosen_endian, Width::Bits8).scan() {
+        for m in make_ctx(data, chosen_endian, Width::Bits8, base).scan() {
             if out.len() >= MAX_CANDIDATES {
                 break;
             }
@@ -503,7 +564,7 @@ mod tests {
     #[test]
     fn detects_big_endian_table() {
         let buf = build(16, 10, 32, Endian::Big);
-        let maps = make_ctx(&buf, Endian::Big, Width::Bits16).scan();
+        let maps = make_ctx(&buf, Endian::Big, Width::Bits16, 0).scan();
         assert!(
             maps.iter().any(|m| matches!(
                 m.dimensions,
@@ -518,7 +579,7 @@ mod tests {
     fn detects_little_endian_table() {
         // The old scanner was 16-bit BE only and read this as noise.
         let buf = build(16, 10, 32, Endian::Little);
-        let maps = make_ctx(&buf, Endian::Little, Width::Bits16).scan();
+        let maps = make_ctx(&buf, Endian::Little, Width::Bits16, 0).scan();
         assert!(
             maps.iter().any(|m| matches!(
                 m.dimensions,
@@ -532,7 +593,7 @@ mod tests {
     #[test]
     fn detects_8bit_table() {
         let buf = build8(6, 8, 40);
-        let maps = make_ctx(&buf, Endian::Big, Width::Bits8).scan();
+        let maps = make_ctx(&buf, Endian::Big, Width::Bits8, 0).scan();
         assert!(
             maps.iter().any(|m| matches!(
                 m.dimensions,
@@ -591,6 +652,68 @@ mod tests {
 
     // --- invariants ---
 
+    // --- range-limited (map-area) scan ---
+
+    #[test]
+    fn range_scan_offsets_addresses_to_absolute() {
+        // A table planted after a leading region: scanning only the tail range
+        // must still report whole-file (absolute) addresses.
+        let lead = vec![0u8; 4096];
+        let table = build(16, 10, 0, Endian::Little);
+        let mut buf = lead.clone();
+        buf.extend(&table);
+
+        let ranged = scan_potential_maps_in_range(&buf, lead.len(), buf.len());
+        let m = ranged
+            .iter()
+            .find(|m| matches!(
+                m.dimensions,
+                MapDimensions::TwoDimensional { rows: 16, cols: 10 }
+            ))
+            .expect("planted table not found in ranged scan");
+        // Its Y axis is at the very start of the appended table, i.e. lead.len().
+        assert_eq!(m.y_axis_address.unwrap() as usize, lead.len());
+        // The name embeds the absolute data address, not a slice-relative one.
+        assert!(m
+            .name
+            .as_deref()
+            .unwrap()
+            .contains(&format!("{:X}", m.address)));
+    }
+
+    #[test]
+    fn range_scan_skips_out_of_range_tables() {
+        // A table in the leading region is NOT reported when the range starts
+        // after it.
+        let table = build(16, 10, 0, Endian::Little);
+        let mut buf = table.clone();
+        buf.extend(vec![0u8; 4096]);
+        let ranged = scan_potential_maps_in_range(&buf, table.len(), buf.len());
+        assert!(
+            ranged.is_empty(),
+            "table before the range must not be reported, got {}",
+            ranged.len()
+        );
+    }
+
+    #[test]
+    fn map_area_skips_edc17_code_half_and_trailing_fill() {
+        let mut data = vec![0xAAu8; 0x100000]; // 1 MB "code"
+        data.extend(vec![0x11u8; 0x80000]); // 0.5 MB "data"
+        data.extend(vec![0xFFu8; 0x80000]); // 0.5 MB trailing flash-fill
+        let (start, end) = map_area_for("EDC17C", &data);
+        assert_eq!(start, data.len() / 2, "should skip the low (code) half");
+        assert_eq!(end, 0x180000, "should stop before the trailing fill");
+    }
+
+    #[test]
+    fn map_area_unknown_family_scans_from_start() {
+        let data = vec![0x11u8; 4096];
+        let (start, end) = map_area_for("SomethingElse", &data);
+        assert_eq!(start, 0);
+        assert_eq!(end, data.len());
+    }
+
     #[test]
     fn ignores_uniform_fill() {
         // 4 KB of 0xFF flash fill -- no axes, no data, must yield nothing.
@@ -605,7 +728,7 @@ mod tests {
     #[test]
     fn candidate_has_axes_and_category() {
         let buf = build(8, 8, 0, Endian::Big);
-        let maps = make_ctx(&buf, Endian::Big, Width::Bits16).scan();
+        let maps = make_ctx(&buf, Endian::Big, Width::Bits16, 0).scan();
         let m = maps
             .iter()
             .find(|m| matches!(

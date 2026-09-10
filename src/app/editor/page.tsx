@@ -74,7 +74,7 @@ import { PromptModal } from "@/components/prompt-modal";
 import { correctChecksumByEcuType, isChecksumSupported, ChecksumResult } from "@/lib/ecu/bosch/checksums";
 import { disableDTC, enableDTC, detectDTCs, type DetectedDTC, type CodeblockInfo } from "@/lib/ecu/bosch/dtc";
 import { saveBytesToFile } from "@/lib/local/save-file";
-import { identifyEcu, bytesToBase64, detectorVersion, detectMaps } from "@/lib/local/detector";
+import { identifyEcu, bytesToBase64, detectorVersion, detectMaps, scanPotentialMapsInArea, BETA_ECUS } from "@/lib/local/detector";
 import * as localStore from "@/lib/local/store";
 import type { CustomSolution } from "@/lib/local/store";
 import { ThemeProvider, useTheme } from "@/contexts/theme-context";
@@ -6602,6 +6602,41 @@ await axios.put("/api/versioning/map-edits", { versionId: currentVersionId, edit
     void persistDetectionResults(detectionResults);
   }, [projectData, persistDetectionResults]);
 
+  // Re-scan the file's MAP area for potential maps (beta EDC17 first). Skips the
+  // code region + trailing flash-fill on the Rust side and rewrites the
+  // potential_maps list, leaving the user's kept my_maps untouched. Uses the
+  // ORIGINAL (stock) bytes so the scan is deterministic and unaffected by edits.
+  const [rescanningArea, setRescanningArea] = useState(false);
+  const rescanPotentialMaps = useCallback(async () => {
+    if (!projectData || rescanningArea) return;
+    const bytes = originalFileDataRef.current ?? projectData.file_data ?? [];
+    if (!bytes.length) {
+      toast({ title: t.common?.error || "Error", description: "File data is not loaded yet.", variant: "destructive" });
+      return;
+    }
+    setRescanningArea(true);
+    try {
+      const result = await scanPotentialMapsInArea({
+        fileDataBase64: bytesToBase64(new Uint8Array(bytes)),
+        fileName: projectData.original_name || projectData.file_name || "file.bin",
+        ecuType: projectData.ecu_type,
+      });
+      const potential_maps = result.maps || [];
+      const detectionResults = { ...projectData.detectionResults, potential_maps };
+      setProjectData({ ...projectData, detectionResults });
+      void persistDetectionResults(detectionResults);
+      setExpandedFolders((prev) => new Set(prev).add("__potential__"));
+      toast({
+        title: "Map area re-scanned",
+        description: `${potential_maps.length} potential map${potential_maps.length === 1 ? "" : "s"} found in the map area.`,
+      });
+    } catch (e: any) {
+      toast({ title: t.common?.error || "Error", description: `Re-scan failed: ${e?.message || e}`, variant: "destructive" });
+    } finally {
+      setRescanningArea(false);
+    }
+  }, [projectData, rescanningArea, persistDetectionResults, t]);
+
   // Manual map creation (available on every file). Modal state here; the
   // handler is defined after handleMapClick so it can open the new map.
   const [showCreateMapModal, setShowCreateMapModal] = useState(false);
@@ -7557,25 +7592,47 @@ await axios.put("/api/versioning/map-edits", { versionId: currentVersionId, edit
                   </div>
                 );
               };
+              // Show the Potential maps folder (with its re-scan button) for
+              // files that go through the generic scanner: any file that already
+              // has candidates, plus beta families (EDC17) and unrecognized
+              // ("unknown") imports — never for the supported EDC15/16 detectors.
+              const ecuType = projectData.ecu_type || '';
+              const isGenericScanFile = potentialMaps.length > 0 || ecuType === 'unknown' || BETA_ECUS.has(ecuType);
               return (
                 <>
                   {/* Potential maps (heuristic candidates) */}
-                  {potentialMaps.length > 0 && (
+                  {isGenericScanFile && (
                     <div>
-                      <button
-                        onClick={() => toggleFolder('__potential__')}
-                        className={`flex items-center gap-2 w-full px-2 py-1.5 rounded transition-colors ${theme === 'light' ? 'hover:bg-black/5' : 'hover:bg-white/5'}`}
-                      >
-                        <ChevronRight className={`w-4 h-4 transition-transform duration-200 ${expandedFolders.has('__potential__') ? 'rotate-90' : ''}`} style={{ color: getTextColor() }} />
-                        {expandedFolders.has('__potential__')
-                          ? <FolderOpen className={`w-4 h-4 ${theme === 'light' ? 'text-amber-600' : 'text-yellow-500'}`} />
-                          : <Folder className={`w-4 h-4 ${theme === 'light' ? 'text-amber-600' : 'text-yellow-500'}`} />}
-                        <span className="text-sm" style={{ color: theme === 'light' ? '#000000' : 'rgba(255,255,255,0.7)' }}>Potential maps</span>
-                        <span className="text-[10px] ml-auto px-1.5 rounded-full border tabular-nums text-center" style={badgeStyle}>{potentialMaps.length}</span>
-                      </button>
+                      <div className="flex items-center gap-1">
+                        <button
+                          onClick={() => toggleFolder('__potential__')}
+                          className={`flex items-center gap-2 flex-1 min-w-0 px-2 py-1.5 rounded transition-colors ${theme === 'light' ? 'hover:bg-black/5' : 'hover:bg-white/5'}`}
+                        >
+                          <ChevronRight className={`w-4 h-4 transition-transform duration-200 ${expandedFolders.has('__potential__') ? 'rotate-90' : ''}`} style={{ color: getTextColor() }} />
+                          {expandedFolders.has('__potential__')
+                            ? <FolderOpen className={`w-4 h-4 ${theme === 'light' ? 'text-amber-600' : 'text-yellow-500'}`} />
+                            : <Folder className={`w-4 h-4 ${theme === 'light' ? 'text-amber-600' : 'text-yellow-500'}`} />}
+                          <span className="text-sm" style={{ color: theme === 'light' ? '#000000' : 'rgba(255,255,255,0.7)' }}>Potential maps</span>
+                          <span className="text-[10px] ml-auto px-1.5 rounded-full border tabular-nums text-center" style={badgeStyle}>{potentialMaps.length}</span>
+                        </button>
+                        <button
+                          onClick={rescanPotentialMaps}
+                          disabled={rescanningArea}
+                          title={rescanningArea ? 'Scanning the map area…' : 'Re-scan the map area for potential maps'}
+                          className={`flex-shrink-0 mr-1 h-6 w-6 flex items-center justify-center rounded-md transition-colors ${rescanningArea ? 'opacity-50 cursor-default' : (theme === 'light' ? 'hover:bg-black/10' : 'hover:bg-white/10')}`}
+                          style={{ color: actionColor }}
+                        >
+                          <RefreshCw className={`w-3.5 h-3.5 ${rescanningArea ? 'animate-spin' : ''}`} />
+                        </button>
+                      </div>
                       <div className={`overflow-hidden transition-all duration-300 ease-in-out ${expandedFolders.has('__potential__') ? 'max-h-[20000px] opacity-100' : 'max-h-0 opacity-0'}`}>
                         <div className="ml-1 mt-1 space-y-0.5">
-                          {/* 400 rows max — only mounted while expanded */}
+                          {expandedFolders.has('__potential__') && potentialMaps.length === 0 && (
+                            <div className="px-2 py-1.5 text-xs" style={{ color: dimColor }}>
+                              No candidates yet — press the ↻ button to scan the map area.
+                            </div>
+                          )}
+                          {/* up to MAX_CANDIDATES rows — only mounted while expanded */}
                           {expandedFolders.has('__potential__') && potentialMaps.map((m, i) => renderRow(m, i, 'potential'))}
                         </div>
                       </div>

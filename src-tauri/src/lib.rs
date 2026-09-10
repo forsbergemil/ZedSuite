@@ -42,6 +42,7 @@ pub fn run() {
             commands::identify_ecu,
             commands::detect_maps,
             commands::scan_potential_maps,
+            commands::scan_potential_maps_in_area,
             commands::detector_version,
             commands::list_ecus,
             commands::save_binary_file,

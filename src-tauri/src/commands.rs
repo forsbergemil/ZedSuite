@@ -199,6 +199,53 @@ pub fn scan_potential_maps(request: DetectMapsArgs) -> Result<DetectMapsResponse
     Ok(response)
 }
 
+/// Re-scan for CANDIDATE tables restricted to the ECU's MAP area only.
+///
+/// Same heuristic scanner as `scan_potential_maps`, but instead of walking the
+/// whole file it skips the leading program/code region and the trailing
+/// flash-fill and scans only the calibration/data region in between (see
+/// `generic::map_area_for`). This is what the "Re-scan map area" button calls:
+/// on a big EDC17 dump the code half is pure noise for a structural scanner, so
+/// skipping it removes false positives and speeds the scan. `ecu_type` selects
+/// the family map-area rule ("EDC17C" for the beta BMW/PSA EDC17 support); an
+/// unknown family scans from the start (trailing fill still trimmed).
+#[tauri::command]
+pub fn scan_potential_maps_in_area(request: DetectMapsArgs) -> Result<DetectMapsResponse, String> {
+    let start = Instant::now();
+    let data = decode_base64(&request.file_data_base64)?;
+    let ecu = request.ecu_type.as_deref().unwrap_or("");
+    let (area_start, area_end) = crate::detector::generic::map_area_for(ecu, &data);
+
+    log::warn!(
+        "🔎 [SCAN-AREA] file: {} ({} bytes), ecu: {}, area 0x{:X}..0x{:X}",
+        request.file_name,
+        data.len(),
+        ecu,
+        area_start,
+        area_end
+    );
+
+    let maps = crate::detector::generic::scan_potential_maps_in_range(&data, area_start, area_end);
+
+    let response = DetectMapsResponse {
+        success: true,
+        total_maps: maps.len(),
+        maps,
+        processing_time_ms: start.elapsed().as_millis(),
+        file_size: data.len(),
+        detector_version: DETECTOR_VERSION,
+        expected_maps: None,
+    };
+
+    log::warn!(
+        "✅ [SCAN-AREA] {} candidate map(s) in {}ms",
+        response.total_maps,
+        response.processing_time_ms
+    );
+
+    Ok(response)
+}
+
 /// Rapport de complétude EDC16 : familles de maps qui existent TOUJOURS dans
 /// un fichier de cette famille (invariants métier). Un compte insuffisant
 /// signale un fichier probablement déjà fortement modifié — l'app conseille
