@@ -37,6 +37,20 @@ export const SUPPORTED_ECUS = new Set([
   "EDC16U34",
 ]);
 
+/**
+ * BETA families: identified with confidence, but with no dedicated per-family
+ * detector — their maps come from the generic potential-maps scanner. A project
+ * created for one of these keeps its real ECU type (so versioning identity
+ * checks pass) rather than the anonymous "unknown". EDC17 (BMW etc.) is the
+ * first; the Rust identifier tags it from its "EDC17_..." metadata string.
+ */
+export const BETA_ECUS = new Set(["EDC17C"]);
+
+/** True for an ECU type that can be imported and scanned (supported or beta). */
+export function isImportableEcu(ecuType?: string): boolean {
+  return !!ecuType && (SUPPORTED_ECUS.has(ecuType) || BETA_ECUS.has(ecuType));
+}
+
 export async function identifyEcu(
   fileDataBase64: string,
   fileName: string
@@ -59,6 +73,28 @@ export async function detectMaps(args: {
       file_name: args.fileName,
       ecu_type: args.ecuType,
       tuned_mode: args.tunedMode ?? false,
+    },
+  });
+}
+
+/**
+ * Family-agnostic heuristic scan for CANDIDATE tables ("potential maps").
+ * Used for files the strict identifier does not recognize: the returned maps
+ * are guesses (low confidence, raw 16-bit values), meant to be shown only as
+ * highlighted regions in the hexdump — never mixed into a recognized ECU's
+ * trusted detection. Mirrors detectMaps but calls the scan_potential_maps
+ * command and ignores ecuType/tunedMode.
+ */
+export async function scanPotentialMaps(args: {
+  fileDataBase64: string;
+  fileName: string;
+}): Promise<DetectionResults> {
+  return invoke<DetectionResults>("scan_potential_maps", {
+    request: {
+      file_data_base64: args.fileDataBase64,
+      file_name: args.fileName,
+      ecu_type: undefined,
+      tuned_mode: false,
     },
   });
 }

@@ -24,7 +24,7 @@ type ViewMode = "text" | "2d" | "3d";
 
 // Cache pour mémoriser les données extraites de chaque map (par adresse)
 // Ce cache évite de recalculer les données à chaque changement de map
-const CACHE_VERSION = "2026-09-axis-corrections-v38";
+const CACHE_VERSION = "2026-09-axis-corrections-v39-stock";
 
 // Map globale pour sauvegarder les positions de caméra de chaque map 3D
 // Persiste entre les montages/démontages du composant
@@ -98,6 +98,7 @@ function writeClipboard(value: InternalClipboard | null): void {
 
 interface CachedMapData {
   mapValues: number[][];
+  stockValues?: number[][];
   xAxisLabels: string[];
   yAxisLabels: string[];
   axesSwapped: boolean;
@@ -378,6 +379,10 @@ interface MapViewerProps {
     rows_reversed?: boolean;
   };
   fileData: number[];
+  // Original (stock) file bytes — used only to compute the true "original"
+  // reference for the Ori / % / diff views, so ANY change over the map region
+  // (map-cell edits AND direct hexdump/binary edits) shows correctly.
+  originalFileData?: number[];
   projectName?: string;
   fileName?: string;
   viewMode?: ViewMode; // Controlled viewMode from parent
@@ -483,6 +488,7 @@ interface MapViewerProps {
 export function MapViewer({
   mapData,
   fileData,
+  originalFileData,
   projectName,
   fileName,
   viewMode: controlledViewMode,
@@ -614,7 +620,17 @@ const [yAxisLabels, setYAxisLabels] = useState<string[]>([]);
 // affiche « . » à la place d'un index, sur tous les calculateurs
 const [axisIsIndex, setAxisIsIndex] = useState<{ x: boolean; y: boolean }>({ x: false, y: false });
 const [changedCells, setChangedCells] = useState<Record<string, number>>({});
+// ASCII view for 1D maps that hold text (e.g. a software-version string).
+const [showAscii, setShowAscii] = useState(false);
+// Show the ORIGINAL (unmodified) cell values instead of the current ones.
+const [showOriginal, setShowOriginal] = useState(false);
+// Show each cell as its % change vs the original value.
+const [showPercent, setShowPercent] = useState(false);
+// The base the map rebuilds edits on top of (current-file decode).
 const originalValuesRef = useRef<number[][]>([]);
+// The true STOCK values (original file). Used as the reference for the diff
+// colouring and the Ori / % views, so hexdump/binary edits show too.
+const stockValuesRef = useRef<number[][]>([]);
 const [contextMenu, setContextMenu] = useState<{
   x: number;
   y: number;
@@ -2118,6 +2134,7 @@ const [axesSwapped, setAxesSwapped] = useState<boolean>(false); // Track if axes
         && cached.invert === cacheInvert) {
       return {
         mapValues: cached.mapValues,
+        stockValues: cached.stockValues ?? cached.mapValues,
         xAxisLabels: cached.xAxisLabels,
         yAxisLabels: cached.yAxisLabels,
         axesSwapped: cached.axesSwapped,
@@ -2678,66 +2695,49 @@ const [axesSwapped, setAxesSwapped] = useState<boolean>(false); // Track if axes
     if (process.env.NODE_ENV !== 'production' && cellLayout.axesSwapped !== needsAxisSwap) {
       console.warn('[MapViewer] cell layout swap mismatch for', mapData.name, cellLayout.axesSwapped, needsAxisSwap);
     }
+    // Decode config (constant per map) hoisted so the SAME logic decodes both the
+    // current bytes and the original (stock) bytes for the diff / Ori / % views.
+    const isSOISelector = mapData.name?.toLowerCase().includes('soi selector');
+    const mapIsLittleEndian = mapData.is_little_endian === true || isSOISelector;
+    const useBigEndian = !mapIsLittleEndian && isBigEndianEcu(ecuType);
+    const isAlwaysSignedMap =
+      mapNameLower.includes('drivers wish') || mapNameLower.includes('driver wish') ||
+      mapNameLower.includes('egr hysteresis');
+    const correction = dsAxisFactor(displaySettings?.map) ?? (mapData.correction_factor ?? 1.0);
+    const offsetValue =
+      typeof displaySettings?.map?.offset === 'number' && isFinite(displaySettings.map.offset)
+        ? displaySettings.map.offset
+        : (mapData.offset ?? 0.0);
+    const decodeAt = (src: number[], offset: number): number | null => {
+      if (offset < 0 || offset + cellBytes - 1 >= src.length) return null;
+      let rawValue: number;
+      if (cellBytes === 1) {
+        rawValue = src[offset];
+        if (dataTypeStr === 'Int8' && rawValue > 127) rawValue = rawValue - 256;
+      } else {
+        rawValue = useBigEndian
+          ? ((src[offset] << 8) | src[offset + 1])
+          : (src[offset] | (src[offset + 1] << 8));
+        if ((mapData.data_type === 'Int16' || isAlwaysSignedMap) && rawValue > 32767) rawValue = rawValue - 65536;
+      }
+      return (rawValue * correction) + offsetValue;
+    };
+    const hasStock = Array.isArray(originalFileData) && originalFileData.length > 0;
+    const stockRows: number[][] = [];
     for (let row = 0; row < rows; row++) {
       const rowValues: number[] = [];
+      const stockRowValues: number[] = [];
       for (let col = 0; col < cols; col++) {
         // Offset fichier de la cellule (colonne-major pour le torque limiter et
         // les IQ by MAF/MAP transposés, transposition standard sinon)
         const offset = startAddress + cellLayout.cellIndex(row, col) * cellBytes;
-        if (offset + cellBytes - 1 < fileData.length) {
-          let rawValue: number;
-          if (cellBytes === 1) {
-            // 8-bit cells: no endianness, sign only for Int8
-            rawValue = fileData[offset];
-            if (dataTypeStr === 'Int8' && rawValue > 127) {
-              rawValue = rawValue - 256;
-            }
-          } else {
-            // Determine endianness: check map-specific flag first, then ECU type
-            // EDC16 (all variants) and Marelli MJD6 use Big-Endian by default,
-            // EDC15 and others use Little-Endian
-            // Special case: SOI Selector is always Little-Endian (even if flag is missing from old detections)
-            const isSOISelector = mapData.name?.toLowerCase().includes('soi selector');
-            const mapIsLittleEndian = mapData.is_little_endian === true || isSOISelector;
-            const useBigEndian = !mapIsLittleEndian && isBigEndianEcu(ecuType);
-
-            if (useBigEndian) {
-              // BIG ENDIAN for EDC16/MJD6: high byte first, low byte second
-              rawValue = (fileData[offset] << 8) | fileData[offset + 1];
-            } else {
-              // LITTLE ENDIAN for EDC15 and others (or maps with is_little_endian=true)
-              rawValue = fileData[offset] | (fileData[offset + 1] << 8);
-            }
-
-            // Convert to signed 16-bit (i16) if data_type is Int16, OR for maps
-            // that are ALWAYS signed by nature: "Drivers wish" (MJD6/EDC16)
-            // carries negative torque in its engine-brake cells (raw ~0xF6xx),
-            // et "Driver wish"/"Inverse driver wish" (EDC15, WinOLS bSigned=1)
-            // portent des IQ négatifs (raw 0xFFxx → -0.9, pas 654.5). Forcer le
-            // signe couvre les detection_data antérieures taguées UInt16.
-            // « EGR hysteresis » (EDC16) : seuils signés (0xFFFF = -1), les
-            // detection_data antérieures à v31 les taguaient UInt16.
-            const isAlwaysSignedMap =
-              mapNameLower.includes('drivers wish') || mapNameLower.includes('driver wish') ||
-              mapNameLower.includes('egr hysteresis');
-            if ((mapData.data_type === 'Int16' || isAlwaysSignedMap) && rawValue > 32767) {
-              rawValue = rawValue - 65536;
-            }
-          }
-          // Apply correction factor and offset (per-project overrides from
-          // the Properties window win over the detected values)
-          const correction = dsAxisFactor(displaySettings?.map) ?? (mapData.correction_factor ?? 1.0);
-          const offsetValue =
-            typeof displaySettings?.map?.offset === 'number' && isFinite(displaySettings.map.offset)
-              ? displaySettings.map.offset
-              : (mapData.offset ?? 0.0);
-          const correctedValue = (rawValue * correction) + offsetValue;
-          rowValues.push(correctedValue);
-        } else {
-          rowValues.push(0);
-        }
+        const v = decodeAt(fileData, offset);
+        rowValues.push(v ?? 0);
+        const sv = hasStock ? decodeAt(originalFileData as number[], offset) : v;
+        stockRowValues.push(sv ?? (v ?? 0));
       }
       values.push(rowValues);
+      stockRows.push(stockRowValues);
     }
 
 
@@ -2901,11 +2901,19 @@ const [axesSwapped, setAxesSwapped] = useState<boolean>(false); // Track if axes
     // display row 0 corresponds to file row N-1.
     const rowsReversed = (rowsReversedCount % 2) === 1;
     const colsReversed = xLabelsWereReversed;
-     
+
+    // Stock (original-file) values in the SAME final order as `values`. The net
+    // effect of every values.reverse()/values[row].reverse() above is exactly
+    // rowsReversed (rows) and colsReversed (cols), which are independent, so we
+    // reproduce that on the parallel stock read instead of mirroring each site.
+    let stockValues = stockRows;
+    if (colsReversed) stockValues = stockValues.map((r) => { const c = [...r]; c.reverse(); return c; });
+    if (rowsReversed) { stockValues = [...stockValues]; stockValues.reverse(); }
 
     // Mettre en cache les r├®sultats
     const cacheData: CachedMapData = {
       mapValues: values,
+      stockValues,
       xAxisLabels: xLabels,
       yAxisLabels: yLabels,
       axesSwapped: needsAxisSwap,
@@ -2924,6 +2932,7 @@ const [axesSwapped, setAxesSwapped] = useState<boolean>(false); // Track if axes
 
     return {
       mapValues: values,
+      stockValues,
       xAxisLabels: xLabels,
       yAxisLabels: yLabels,
       axesSwapped: needsAxisSwap,
@@ -2932,7 +2941,7 @@ const [axesSwapped, setAxesSwapped] = useState<boolean>(false); // Track if axes
       xAxisIsIndex,
       yAxisIsIndex,
     };
-  }, [mapData, fileData, projectName, fileName, displaySettings]);
+  }, [mapData, fileData, originalFileData, projectName, fileName, displaySettings]);
 
   // Reset data when map changes to prevent showing stale data
   useEffect(() => {
@@ -2959,6 +2968,7 @@ const [axesSwapped, setAxesSwapped] = useState<boolean>(false); // Track if axes
       setAxisIsIndex({ x: !!extractedData.xAxisIsIndex, y: !!extractedData.yAxisIsIndex });
       // D'abord stocker les valeurs originales
       originalValuesRef.current = extractedData.mapValues.map(row => [...row]);
+      stockValuesRef.current = (extractedData.stockValues ?? extractedData.mapValues).map(row => [...row]);
       originalXAxisLabelsRef.current = [...extractedData.xAxisLabels];
       originalYAxisLabelsRef.current = [...extractedData.yAxisLabels];
 
@@ -3569,6 +3579,58 @@ const [axesSwapped, setAxesSwapped] = useState<boolean>(false); // Track if axes
       ? Math.min(6, Math.trunc(displaySettings.map.precision))
       : defaultCellDecimals;
 
+  // ── ASCII rendering ─────────────────────────────────────────────
+  // Turns a displayed cell value back into its raw byte(s) and shows them as
+  // characters, so a 1D map holding text (version strings, etc.) is readable.
+  const asciiCellBytes = String(mapData.data_type || '').includes('8') ? 1 : 2;
+  const asciiBigEndian = (() => {
+    const isSOISelector = mapData.name?.toLowerCase().includes('soi selector');
+    const mapIsLittleEndian = mapData.is_little_endian === true || isSOISelector;
+    return !mapIsLittleEndian && isBigEndianEcu(ecuType);
+  })();
+  const asciiFactorEff = (() => {
+    const dm = displaySettings?.map;
+    if (dm && typeof dm.factor === 'number' && isFinite(dm.factor)) {
+      const div = typeof dm.divisor === 'number' && isFinite(dm.divisor) && dm.divisor !== 0 ? dm.divisor : 1;
+      return dm.factor / div;
+    }
+    return mapData.correction_factor ?? 1;
+  })();
+  const asciiOffsetEff = (() => {
+    const dm = displaySettings?.map;
+    return dm && typeof dm.offset === 'number' && isFinite(dm.offset) ? dm.offset : (mapData.offset ?? 0);
+  })();
+  const valueToAscii = (v: number): string => {
+    const raw = Math.round((v - asciiOffsetEff) / (asciiFactorEff || 1));
+    const toChar = (b: number) => (b >= 32 && b <= 126 ? String.fromCharCode(b) : '.');
+    if (asciiCellBytes === 1) return toChar(raw & 0xFF);
+    const hi = (raw >> 8) & 0xFF;
+    const lo = raw & 0xFF;
+    return asciiBigEndian ? toChar(hi) + toChar(lo) : toChar(lo) + toChar(hi);
+  };
+  // Original display value for a cell (looked up in map coords via toMapCoords).
+  const originalDisplayAt = (dRow: number, dCol: number): number | undefined => {
+    const { row, col } = toMapCoords(dRow, dCol);
+    return stockValuesRef.current?.[row]?.[col];
+  };
+  // Cell text honouring the ASCII / Original / % toggles (priority in that
+  // order); falls back to the current value.
+  const renderCellText = (v: number, dRow: number, dCol: number): string => {
+    if (showAscii && isSingleLineMap) return valueToAscii(v);
+    if (showPercent) {
+      const orig = originalDisplayAt(dRow, dCol);
+      if (orig === undefined) return v.toFixed(cellDecimals);
+      if (orig === 0) return v === 0 ? '0%' : '—';
+      const pct = ((v - orig) / orig) * 100;
+      return `${pct > 0 ? '+' : ''}${pct.toFixed(1)}%`;
+    }
+    if (showOriginal) {
+      const orig = originalDisplayAt(dRow, dCol);
+      if (orig !== undefined) return orig.toFixed(cellDecimals);
+    }
+    return v.toFixed(cellDecimals);
+  };
+
   // Format a user-entered axis label so it matches the surrounding labels
   // (e.g. "55" -> "55.00" when other labels are "10.00", "15.00", ...).
   // Falls back to the raw input if it's not a number.
@@ -4166,6 +4228,50 @@ const [axesSwapped, setAxesSwapped] = useState<boolean>(false); // Track if axes
             >
               3D
             </button>
+            <button
+              onClick={() => { setShowOriginal((v) => !v); setShowPercent(false); }}
+              title="Toggle original / modified values"
+              className="px-3 py-1 text-[11px] leading-[14px] font-medium transition-colors"
+              style={{
+                borderLeft: `1px solid ${getCellBorderColor()}`,
+                background: showOriginal ? 'linear-gradient(90deg, #dc2626, #ef4444, #f97316)' : getViewButtonBg(),
+                color: showOriginal ? '#ffffff' : getCellTextColor(),
+              }}
+              onMouseEnter={(e) => { if (!showOriginal) e.currentTarget.style.background = getViewButtonBgHover(); }}
+              onMouseLeave={(e) => { if (!showOriginal) e.currentTarget.style.background = getViewButtonBg(); }}
+            >
+              Ori
+            </button>
+            <button
+              onClick={() => { setShowPercent((v) => !v); setShowOriginal(false); }}
+              title="Show % change vs original"
+              className="px-3 py-1 text-[11px] leading-[14px] font-medium transition-colors"
+              style={{
+                borderLeft: `1px solid ${getCellBorderColor()}`,
+                background: showPercent ? 'linear-gradient(90deg, #dc2626, #ef4444, #f97316)' : getViewButtonBg(),
+                color: showPercent ? '#ffffff' : getCellTextColor(),
+              }}
+              onMouseEnter={(e) => { if (!showPercent) e.currentTarget.style.background = getViewButtonBgHover(); }}
+              onMouseLeave={(e) => { if (!showPercent) e.currentTarget.style.background = getViewButtonBg(); }}
+            >
+              %
+            </button>
+            {isSingleLineMap && (
+              <button
+                onClick={() => setShowAscii((v) => !v)}
+                title="Show cell bytes as ASCII text"
+                className="px-3.5 py-1 text-[11px] leading-[14px] font-medium transition-colors"
+                style={{
+                  borderLeft: `1px solid ${getCellBorderColor()}`,
+                  background: showAscii ? 'linear-gradient(90deg, #dc2626, #ef4444, #f97316)' : getViewButtonBg(),
+                  color: showAscii ? '#ffffff' : getCellTextColor(),
+                }}
+                onMouseEnter={(e) => { if (!showAscii) e.currentTarget.style.background = getViewButtonBgHover(); }}
+                onMouseLeave={(e) => { if (!showAscii) e.currentTarget.style.background = getViewButtonBg(); }}
+              >
+                ASCII
+              </button>
+            )}
           </div>
         </div>
       </div>
@@ -4369,7 +4475,7 @@ const [axesSwapped, setAxesSwapped] = useState<boolean>(false); // Track if axes
                                     height: 'var(--zs-cell-h, 20px)'
                                   }}
                                 >
-                                  {value.toFixed(cellDecimals)}
+                                  {renderCellText(value, rowIndex, colIndex)}
                                 </td>
                               );
                             })}
@@ -4923,7 +5029,7 @@ const [axesSwapped, setAxesSwapped] = useState<boolean>(false); // Track if axes
                               height: 'var(--zs-cell-h, 20px)'
                             }}
                           >
-                            {value.toFixed(cellDecimals)}
+                            {renderCellText(value, rowIndex, colIndex)}
                           </td>
                         );
                       })}
@@ -5427,6 +5533,51 @@ const [axesSwapped, setAxesSwapped] = useState<boolean>(false); // Track if axes
             >
               3D
             </button>
+            {/* ASCII toggle — read a 1D map's bytes as text */}
+            <button
+              onClick={() => { setShowOriginal((v) => !v); setShowPercent(false); }}
+              title="Toggle original / modified values"
+              className="px-3 py-1 text-[11px] leading-[14px] font-medium transition-colors"
+              style={{
+                borderLeft: `1px solid ${getCellBorderColor()}`,
+                background: showOriginal ? 'linear-gradient(90deg, #dc2626, #ef4444, #f97316)' : getViewButtonBg(),
+                color: showOriginal ? '#ffffff' : getCellTextColor(),
+              }}
+              onMouseEnter={(e) => { if (!showOriginal) e.currentTarget.style.background = getViewButtonBgHover(); }}
+              onMouseLeave={(e) => { if (!showOriginal) e.currentTarget.style.background = getViewButtonBg(); }}
+            >
+              Ori
+            </button>
+            <button
+              onClick={() => { setShowPercent((v) => !v); setShowOriginal(false); }}
+              title="Show % change vs original"
+              className="px-3 py-1 text-[11px] leading-[14px] font-medium transition-colors"
+              style={{
+                borderLeft: `1px solid ${getCellBorderColor()}`,
+                background: showPercent ? 'linear-gradient(90deg, #dc2626, #ef4444, #f97316)' : getViewButtonBg(),
+                color: showPercent ? '#ffffff' : getCellTextColor(),
+              }}
+              onMouseEnter={(e) => { if (!showPercent) e.currentTarget.style.background = getViewButtonBgHover(); }}
+              onMouseLeave={(e) => { if (!showPercent) e.currentTarget.style.background = getViewButtonBg(); }}
+            >
+              %
+            </button>
+            {isSingleLineMap && (
+              <button
+                onClick={() => setShowAscii((v) => !v)}
+                title="Show cell bytes as ASCII text"
+                className="px-3.5 py-1 text-[11px] leading-[14px] font-medium transition-colors"
+                style={{
+                  borderLeft: `1px solid ${getCellBorderColor()}`,
+                  background: showAscii ? 'linear-gradient(90deg, #dc2626, #ef4444, #f97316)' : getViewButtonBg(),
+                  color: showAscii ? '#ffffff' : getCellTextColor(),
+                }}
+                onMouseEnter={(e) => { if (!showAscii) e.currentTarget.style.background = getViewButtonBgHover(); }}
+                onMouseLeave={(e) => { if (!showAscii) e.currentTarget.style.background = getViewButtonBg(); }}
+              >
+                ASCII
+              </button>
+            )}
           </div>
         )}
       </div>

@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useRef, useMemo, useCallback, memo } from "react";
 import { createPortal } from "react-dom";
-import { X, ChevronLeft, ChevronRight, ChevronDown, Check, ArrowLeftRight, Loader2 } from "lucide-react";
+import { X, ChevronLeft, ChevronRight, ChevronDown, Check, ArrowLeftRight, Loader2, Link2, Link2Off } from "lucide-react";
 import { useI18n } from "@/contexts/i18n-context";
 import { useTheme } from "@/contexts/theme-context";
 import { Button } from "@/components/ui/button";
@@ -23,6 +23,9 @@ interface Difference {
   address: number;
   value1: number;
   value2: number;
+  // Which panel this difference belongs to (its address is in that panel's
+  // file space). Defaults to "left" for the classic mutual comparison.
+  side?: "left" | "right";
 }
 
 interface MapRegion {
@@ -59,11 +62,37 @@ interface CompareModalProps {
   hexdumpByteOrder?: "hilo" | "lohi";
   mapRegions?: MapRegion[];
   ecuType?: string;
+  // Other projects and their versions, so a specific version of ANOTHER project
+  // can be compared. Each (project, version) appears in the selectors as a
+  // pseudo-version; picking one rebuilds its bytes via resolveExternalVersionData.
+  externalProjects?: { fileId: string; name: string; ecuType?: string; versions: { id: string; name: string }[] }[];
+  resolveExternalVersionData?: (fileId: string, versionId: string) => Promise<number[]>;
+  /** Name of the project the editor has open (the "self" project). */
+  currentProjectName?: string;
 }
+
+// Pseudo-version id for a version of another project: __ext__:<fileId>:<versionId>.
+const EXT_PREFIX = "__ext__:";
+// Reference sentinel: "compare this panel to the OTHER panel's displayed file".
+const OTHER_SIDE = "__other__";
 
 /** Lecture d'une valeur 16 bits selon l'ordre des octets choisi. */
 const read16 = (arr: number[], off: number, order: "hilo" | "lohi"): number =>
   order === "hilo" ? (((arr[off] ?? 0) << 8) | (arr[off + 1] ?? 0)) : ((arr[off] ?? 0) | ((arr[off + 1] ?? 0) << 8));
+
+/** First index of `needle` in `hay` at/after `from`, or -1. */
+function findBytes(hay: number[], needle: number[], from: number): number {
+  if (needle.length === 0) return -1;
+  const last = hay.length - needle.length;
+  for (let i = Math.max(0, from); i <= last; i++) {
+    let ok = true;
+    for (let j = 0; j < needle.length; j++) {
+      if ((hay[i + j] & 0xff) !== (needle[j] & 0xff)) { ok = false; break; }
+    }
+    if (ok) return i;
+  }
+  return -1;
+}
 
 // Id réservé de la pseudo-version « État actuel (non sauvegardé) »
 const CURRENT_STATE_ID = "__current_state__";
@@ -185,12 +214,14 @@ function VersionSelect({
 
   return (
     <div className="flex-1 min-w-0" ref={rootRef}>
-      <label
-        className="block text-[11px] mb-1"
-        style={{ color: theme === "light" ? "#666666" : "#aaaaaa" }}
-      >
-        {label}
-      </label>
+      {label && (
+        <label
+          className="block text-[11px] mb-1"
+          style={{ color: theme === "light" ? "#666666" : "#aaaaaa" }}
+        >
+          {label}
+        </label>
+      )}
       <button
         type="button"
         onClick={toggleMenu}
@@ -298,15 +329,25 @@ interface CompareRowProps {
   hexdumpFormat: "hex" | "dec";
   bytesPerRow: number;
   byteToMapInfo: Map<number, ByteMapInfo>;
-  diffAddresses: Set<number>;
+  // Alignment offset: this panel's cell at A is compared to the other panel's
+  // cell at A + (side==="left" ? offsetBytes : -offsetBytes).
+  offsetBytes: number;
   // -1 when not in this row
   currentDiffAddress: number;
   // -1 when not in this row
   selectedAddress: number;
   // null when the hovered map does not intersect this row
   hoveredMapAddress: number | null;
+  // Area selection on THIS side (byte range) and a found matching region, each
+  // -1 when not present on this side.
+  areaStart: number;
+  areaEnd: number;
+  foundStart: number;
+  foundEnd: number;
   onSelectAddress: (address: number) => void;
   onHoverMap: (address: number | null) => void;
+  onAreaDown: (side: "left" | "right", byteOffset: number) => void;
+  onAreaEnter: (side: "left" | "right", byteOffset: number) => void;
 }
 
 const CompareRow = memo(function CompareRow({
@@ -320,12 +361,18 @@ const CompareRow = memo(function CompareRow({
   hexdumpFormat,
   bytesPerRow,
   byteToMapInfo,
-  diffAddresses,
+  offsetBytes,
   currentDiffAddress,
   selectedAddress,
   hoveredMapAddress,
+  areaStart,
+  areaEnd,
+  foundStart,
+  foundEnd,
   onSelectAddress,
   onHoverMap,
+  onAreaDown,
+  onAreaEnter,
 }: CompareRowProps) {
   const bytesPerValue = hexdumpSize === "8b" ? 1 : 2;
   const startByte = rowIndex * bytesPerRow;
@@ -387,9 +434,11 @@ const CompareRow = memo(function CompareRow({
             ? value.toString(16).toUpperCase().padStart(4, "0")
             : value.toString(10).padStart(5, "0");
       }
+      // Compare against this side's reference, shifted by its offset.
+      const otherAddr = byteOffset + offsetBytes;
       const other = bytesPerValue === 1
-        ? (otherData[byteOffset] ?? 0)
-        : read16(otherData, byteOffset, byteOrder);
+        ? (otherData[otherAddr] ?? 0)
+        : read16(otherData, otherAddr, byteOrder);
       if (value > other) diffSign = 1;
       else if (value < other) diffSign = -1;
     } else {
@@ -403,18 +452,25 @@ const CompareRow = memo(function CompareRow({
           : "     ";
     }
 
-    const isDiff = diffAddresses.has(byteOffset);
+    // A cell differs when its value ≠ the offset-aligned value in the other file.
+    const isDiff = diffSign !== 0;
     const isCurrentDiff = byteOffset === currentDiffAddress;
     const isSelected = selectedAddress === byteOffset;
+    const isArea = areaStart >= 0 && byteOffset >= areaStart && byteOffset <= areaEnd;
+    const isFound = foundStart >= 0 && byteOffset >= foundStart && byteOffset <= foundEnd;
 
     // Check if this cell is in a hovered map region
     const isInHoveredMap = hoveredMapAddress !== null && mapInfo && mapInfo.mapRegion.address === hoveredMapAddress;
 
-    // Sélection > diff courante (or) > différence (rouge/bleu directionnel,
-    // convention hexdump/WinOLS) > map (fond gris, hover)
+    // Area selection (violet) / found match (teal) > sélection > diff courante
+    // (or) > différence (rouge/bleu directionnel) > map (fond gris, hover)
     const diffColors = theme === "light" ? DIFF_COLORS.light : DIFF_COLORS.dark;
     let bgColor: string | undefined;
-    if (isSelected) {
+    if (isArea) {
+      bgColor = "#7c3aed"; // violet — the region being searched
+    } else if (isFound) {
+      bgColor = "#0d9488"; // teal — the matching region
+    } else if (isSelected) {
       bgColor = "#3b82f6"; // Blue for selection
     } else if (isCurrentDiff) {
       bgColor = "#ffd700";
@@ -426,7 +482,7 @@ const CompareRow = memo(function CompareRow({
 
     // Determine text color
     let textColor: string;
-    if (isSelected) {
+    if (isArea || isFound || isSelected) {
       textColor = "#ffffff";
     } else if (isCurrentDiff) {
       textColor = "#000000";
@@ -447,13 +503,18 @@ const CompareRow = memo(function CompareRow({
           backgroundColor: bgColor,
           color: textColor,
           marginRight: "2px",
-          borderRadius: isDiff || isSelected ? "2px" : undefined,
-          fontWeight: isCurrentDiff || isSelected || isDiff ? "bold" : undefined,
+          borderRadius: isDiff || isSelected || isArea || isFound ? "2px" : undefined,
+          fontWeight: isCurrentDiff || isSelected || isDiff || isArea || isFound ? "bold" : undefined,
           borderTop: isInMap && !isDiff && !isSelected ? `1px solid ${MAP_COLOR.border}` : undefined,
           borderBottom: isInMap && !isDiff && !isSelected ? `1px solid ${MAP_COLOR.border}` : undefined,
           borderLeft: mapInfo?.isStart && !isDiff && !isSelected ? `1px solid ${MAP_COLOR.border}` : undefined,
           borderRight: mapInfo?.isEnd && !isDiff && !isSelected ? `1px solid ${MAP_COLOR.border}` : undefined,
           cursor: 'pointer',
+        }}
+        onMouseDown={(e) => {
+          // Drag to select an area on this side (for "find in the other file").
+          e.preventDefault();
+          onAreaDown(side, byteOffset);
         }}
         onClick={(e) => {
           e.stopPropagation();
@@ -463,6 +524,7 @@ const CompareRow = memo(function CompareRow({
           if (mapInfo) {
             onHoverMap(mapInfo.mapRegion.address);
           }
+          onAreaEnter(side, byteOffset);
         }}
         onMouseLeave={() => {
           onHoverMap(null);
@@ -551,20 +613,31 @@ export function CompareModal({
   hexdumpByteOrder: initialByteOrder = "lohi",
   mapRegions = [],
   ecuType,
+  externalProjects = [],
+  resolveExternalVersionData,
+  currentProjectName,
 }: CompareModalProps) {
   const { t } = useI18n();
   const { theme } = useTheme();
 
-  // Liste présentée dans les sélecteurs : pseudo-version « État actuel » en
-  // tête (si dispo), puis les versions sauvegardées.
   const hasCurrentState = !!currentFileData && currentFileData.length > 0;
-  const displayVersions = useMemo<VersionDto[]>(() => {
-    if (!hasCurrentState) return versions;
-    return [
-      { id: CURRENT_STATE_ID, fileId, name: t.compare.currentState, isCurrent: false, createdAt: "" },
-      ...versions,
-    ];
-  }, [hasCurrentState, versions, fileId, t.compare.currentState]);
+
+  const isExternalId = (id: string) => id.startsWith(EXT_PREFIX);
+
+  // Flat list of every selectable file: this project's saved versions (and its
+  // unsaved "current state"), then each other project's versions. Labelled
+  // "📁 Project · Version" for the external ones. Used by BOTH the display and
+  // the reference selectors.
+  const allFileOptions = useMemo<VersionDto[]>(() => {
+    const selfName = currentProjectName ? `${currentProjectName} · ` : "";
+    const base: VersionDto[] = hasCurrentState
+      ? [{ id: CURRENT_STATE_ID, fileId, name: `${selfName}${t.compare.currentState}`, isCurrent: false, createdAt: "" }, ...versions.map((v) => ({ ...v, name: `${selfName}${v.name}` }))]
+      : versions.map((v) => ({ ...v, name: `${selfName}${v.name}` }));
+    const ext: VersionDto[] = externalProjects.flatMap((p) =>
+      p.versions.map((v) => ({ id: `${EXT_PREFIX}${p.fileId}:${v.id}`, fileId: p.fileId, name: `📁 ${p.name} · ${v.name}`, isCurrent: false, createdAt: "" }))
+    );
+    return [...base, ...ext];
+  }, [hasCurrentState, versions, fileId, currentProjectName, t.compare.currentState, externalProjects]);
 
   // Local format state (independent from parent)
   const [hexdumpSize, setHexdumpSize] = useState<"8b" | "16b">(initialHexdumpSize);
@@ -574,24 +647,79 @@ export function CompareModal({
   // Selection state
   const [selectedVersion1, setSelectedVersion1] = useState<string>("");
   const [selectedVersion2, setSelectedVersion2] = useState<string>("");
+  // Per-side comparison reference. OTHER_SIDE = compare to the other panel;
+  // otherwise a specific file id (e.g. this side's own Ori). refData holds the
+  // loaded bytes for a specific-file reference (empty when it's OTHER_SIDE).
+  const [refVersion1, setRefVersion1] = useState<string>(OTHER_SIDE);
+  const [refVersion2, setRefVersion2] = useState<string>(OTHER_SIDE);
+  const [refData1, setRefData1] = useState<number[]>([]);
+  const [refData2, setRefData2] = useState<number[]>([]);
   const [isComparing, setIsComparing] = useState(false);
+  // A file from another project is selected on at least one side.
+  const comparingExternal = isExternalId(selectedVersion1) || isExternalId(selectedVersion2);
 
   // Compare view state
   const [showCompareView, setShowCompareView] = useState(false);
   const [version1Data, setVersion1Data] = useState<number[]>([]);
   const [version2Data, setVersion2Data] = useState<number[]>([]);
-  const [differences, setDifferences] = useState<Difference[]>([]);
-  const [currentDiffIndex, setCurrentDiffIndex] = useState(0);
+  // Differences per side (each panel's display vs its reference), with an
+  // independent navigation index for each.
+  const [leftDiffs, setLeftDiffs] = useState<Difference[]>([]);
+  const [rightDiffs, setRightDiffs] = useState<Difference[]>([]);
+  const [leftIdx, setLeftIdx] = useState(0);
+  const [rightIdx, setRightIdx] = useState(0);
   const [selectedAddress, setSelectedAddress] = useState<number | null>(null); // Address clicked by user
   const [hoveredMapAddress, setHoveredMapAddress] = useState<number | null>(null); // Address of hovered map region
+  // Area selection (drag) on one side + the matching region found on the other,
+  // for "find the same area in the other file".
+  const [areaSel, setAreaSel] = useState<{ side: "left" | "right"; start: number; end: number } | null>(null);
+  const areaSelectingRef = useRef(false);
+  const [foundMatch, setFoundMatch] = useState<{ side: "left" | "right"; start: number; end: number } | null>(null);
+  const [findMsg, setFindMsg] = useState<string | null>(null);
 
-  // Virtualization state
-  const [visibleRange, setVisibleRange] = useState({ start: 0, end: 50 });
+  const handleAreaDown = useCallback((side: "left" | "right", byteOffset: number) => {
+    areaSelectingRef.current = true;
+    setAreaSel({ side, start: byteOffset, end: byteOffset });
+    setFoundMatch(null);
+    setFindMsg(null);
+  }, []);
+  const handleAreaEnter = useCallback((side: "left" | "right", byteOffset: number) => {
+    if (!areaSelectingRef.current) return;
+    setAreaSel((prev) => (prev && prev.side === side ? { ...prev, end: byteOffset } : prev));
+  }, []);
+  useEffect(() => {
+    const up = () => { areaSelectingRef.current = false; };
+    document.addEventListener("mouseup", up);
+    return () => document.removeEventListener("mouseup", up);
+  }, []);
+
+  // Virtualization state — one range per panel so they can scroll independently
+  // (when sync is unlocked, or when locked at a non-zero offset).
+  const [visibleRange1, setVisibleRange1] = useState({ start: 0, end: 50 });
+  const [visibleRange2, setVisibleRange2] = useState({ start: 0, end: 50 });
 
   // Scroll refs for synchronized scrolling
   const scrollRef1 = useRef<HTMLDivElement>(null);
   const scrollRef2 = useRef<HTMLDivElement>(null);
   const isScrolling = useRef(false);
+  // Sync-scroll: when locked, panel2.scrollTop = panel1.scrollTop + scrollDelta.
+  // Unlock to scroll independently, then lock again to freeze the current
+  // relative offset (useful to align two files whose data sits at different
+  // offsets). Default: locked at delta 0 (classic 1:1 sync).
+  const [scrollSynced, setScrollSynced] = useState(true);
+  // Mirror of scrollSynced for the async scroll handler: setting scrollTop
+  // programmatically fires a scroll event before a state update commits, so the
+  // handler must read the lock state from a ref, not a stale closure — otherwise
+  // it clobbers a just-set exact offset with the row-quantized scroll delta.
+  const syncedRef = useRef(true);
+  syncedRef.current = scrollSynced;
+  const scrollDeltaRef = useRef(0);
+  // Locked offset expressed in bytes, for the toolbar label (0 = aligned).
+  const [lockOffsetBytes, setLockOffsetBytes] = useState(0);
+  // Current comparison offset in bytes: cell A on the left is compared to cell
+  // A + offsetBytes on the right. Tracks the visual scroll offset (quantized to
+  // rows) so the differences reflect how the panels are aligned right now.
+  const [offsetBytes, setOffsetBytes] = useState(0);
 
   // Resize state
   const [modalSize, setModalSize] = useState({ width: 900, height: 500 });
@@ -612,11 +740,21 @@ export function CompareModal({
   useEffect(() => {
     if (isOpen) {
       setShowCompareView(false);
-      setDifferences([]);
-      setCurrentDiffIndex(0);
+      setLeftDiffs([]);
+      setRightDiffs([]);
+      setLeftIdx(0);
+      setRightIdx(0);
       setSelectedAddress(null);
       setPosition(null);
-      setVisibleRange({ start: 0, end: 50 });
+      setVisibleRange1({ start: 0, end: 50 });
+      setVisibleRange2({ start: 0, end: 50 });
+      setScrollSynced(true);
+      scrollDeltaRef.current = 0;
+      setLockOffsetBytes(0);
+      setOffsetBytes(0);
+      setAreaSel(null);
+      setFoundMatch(null);
+      setFindMsg(null);
       setHexdumpSize(initialHexdumpSize);
       setHexdumpFormat(initialHexdumpFormat);
       setByteOrder(initialByteOrder);
@@ -626,6 +764,11 @@ export function CompareModal({
       const ori = versions.find((v) => v.name === "Ori");
       setSelectedVersion1(ori ? ori.id : "");
       setSelectedVersion2(hasCurrentState ? CURRENT_STATE_ID : "");
+      // References default to "the other panel" (classic left-vs-right).
+      setRefVersion1(OTHER_SIDE);
+      setRefVersion2(OTHER_SIDE);
+      setRefData1([]);
+      setRefData2([]);
     }
     // versions/hasCurrentState volontairement hors deps : ne re-réinitialise
     // qu'à l'OUVERTURE, pas si la liste se rafraîchit pendant l'utilisation.
@@ -635,6 +778,9 @@ export function CompareModal({
   // Create a map of byte address -> map info for quick lookup
   const byteToMapInfo = useMemo(() => {
     const map = new Map<number, ByteMapInfo>();
+    // The map overlay is built from THIS project's maps, meaningless once an
+    // external file is on either side — drop it then.
+    if (comparingExternal) return map;
     const maxLength = Math.max(version1Data.length, version2Data.length, originalFileData.length);
 
     mapRegions.forEach((region) => {
@@ -650,31 +796,70 @@ export function CompareModal({
     });
 
     return map;
-  }, [mapRegions, version1Data.length, version2Data.length, originalFileData.length]);
+  }, [mapRegions, version1Data.length, version2Data.length, originalFileData.length, comparingExternal]);
 
   // Handle scroll for virtualization — rAF-throttled and quantized to
   // RANGE_CHUNK rows so dragging the scrollbar doesn't re-render on every
   // scroll event (same fix as the hexdump viewer).
-  const scrollTicking = useRef(false);
-  const handleVirtualScroll = useCallback((container: HTMLDivElement | null) => {
-    if (!container || scrollTicking.current) return;
-    scrollTicking.current = true;
+  const ticking1 = useRef(false);
+  const ticking2 = useRef(false);
+  const updatePanelRange = useCallback((
+    container: HTMLDivElement | null,
+    setRange: (r: { start: number; end: number } | ((p: { start: number; end: number }) => { start: number; end: number })) => void,
+    tickingRef: React.MutableRefObject<boolean>
+  ) => {
+    if (!container || tickingRef.current) return;
+    tickingRef.current = true;
     requestAnimationFrame(() => {
-      scrollTicking.current = false;
+      tickingRef.current = false;
       const scrollTop = container.scrollTop;
       const containerHeight = container.clientHeight;
-
       const rawStart = Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - OVERSCAN);
       const rawEnd = Math.ceil((scrollTop + containerHeight) / ROW_HEIGHT) + OVERSCAN;
       const start = Math.floor(rawStart / RANGE_CHUNK) * RANGE_CHUNK;
       const end = Math.ceil(rawEnd / RANGE_CHUNK) * RANGE_CHUNK;
-
-      setVisibleRange(prev => (prev.start === start && prev.end === end) ? prev : { start, end });
+      setRange(prev => (prev.start === start && prev.end === end) ? prev : { start, end });
     });
   }, []);
 
+  // Lock/unlock sync-scroll. Unlocking lets the panels scroll independently;
+  // locking captures the current relative offset (panel2 − panel1) and keeps it.
+  const toggleScrollSync = useCallback(() => {
+    if (scrollSynced) {
+      syncedRef.current = false;
+      setScrollSynced(false);
+      return;
+    }
+    const s1 = scrollRef1.current, s2 = scrollRef2.current;
+    const delta = (s1 && s2) ? s2.scrollTop - s1.scrollTop : 0;
+    scrollDeltaRef.current = delta;
+    const bpr = hexdumpSize === "8b" ? VALUES_PER_ROW : VALUES_PER_ROW * 2;
+    // Freeze the offset at the current (row-quantized) scroll delta — for a
+    // manual lock the panels can only be scrolled to whole rows anyway. Set the
+    // ref first so the scroll handler already sees "locked" and won't re-derive.
+    const frozen = Math.round(delta / ROW_HEIGHT) * bpr;
+    syncedRef.current = true;
+    setOffsetBytes(frozen);
+    setLockOffsetBytes(frozen);
+    setScrollSynced(true);
+  }, [scrollSynced, hexdumpSize]);
+
   // Load version data (apply modifications to original)
   const loadVersionData = async (versionId: string): Promise<number[]> => {
+    // Version d'un AUTRE projet : reconstruite via le parent.
+    if (isExternalId(versionId) && resolveExternalVersionData) {
+      const rest = versionId.slice(EXT_PREFIX.length);
+      const sep = rest.indexOf(":");
+      const extFileId = sep >= 0 ? rest.slice(0, sep) : rest;
+      const extVersionId = sep >= 0 ? rest.slice(sep + 1) : "";
+      try {
+        return await resolveExternalVersionData(extFileId, extVersionId);
+      } catch (error) {
+        console.error("resolveExternalVersionData error:", error);
+        return [];
+      }
+    }
+
     // Pseudo-version « État actuel » : octets déjà construits par le parent
     // (fichier courant + édits en mémoire, cf. buildEditedFileData)
     if (versionId === CURRENT_STATE_ID && currentFileData) {
@@ -766,31 +951,25 @@ export function CompareModal({
     }
   };
 
-  // Compare versions - recalculate differences when format changes
-  const recalculateDifferences = useCallback((data1: number[], data2: number[], size: "8b" | "16b") => {
+  // Recalculate differences. `offset` shifts the right file: left address A is
+  // compared to right address A + offset, so the diffs reflect the current
+  // alignment (a correctly-aligned block shows no differences). `.address` is
+  // always the LEFT address.
+  const recalculateDifferences = useCallback((data1: number[], data2: number[], size: "8b" | "16b", offset: number) => {
     const diffs: Difference[] = [];
     const bytesPerValue = size === "8b" ? 1 : 2;
     const maxLength = Math.max(data1.length, data2.length);
     const bigEndian = isBigEndianEcu(ecuType);
+    const read = (arr: number[], addr: number): number => {
+      if (bytesPerValue === 1) return arr[addr] ?? 0;
+      return bigEndian
+        ? ((arr[addr] ?? 0) << 8) | (arr[addr + 1] ?? 0)
+        : (arr[addr] ?? 0) | ((arr[addr + 1] ?? 0) << 8);
+    };
 
     for (let addr = 0; addr < maxLength; addr += bytesPerValue) {
-      let value1: number, value2: number;
-
-      if (bytesPerValue === 1) {
-        value1 = data1[addr] ?? 0;
-        value2 = data2[addr] ?? 0;
-      } else {
-        if (bigEndian) {
-          // BIG ENDIAN for EDC16/MJD6: high byte first, low byte second
-          value1 = ((data1[addr] ?? 0) << 8) | (data1[addr + 1] ?? 0);
-          value2 = ((data2[addr] ?? 0) << 8) | (data2[addr + 1] ?? 0);
-        } else {
-          // LITTLE ENDIAN for EDC15 and others: low byte first, high byte second
-          value1 = (data1[addr] ?? 0) | ((data1[addr + 1] ?? 0) << 8);
-          value2 = (data2[addr] ?? 0) | ((data2[addr + 1] ?? 0) << 8);
-        }
-      }
-
+      const value1 = read(data1, addr);
+      const value2 = read(data2, addr + offset);
       if (value1 !== value2) {
         diffs.push({ address: addr, value1, value2 });
       }
@@ -813,9 +992,13 @@ export function CompareModal({
       setVersion1Data(data1);
       setVersion2Data(data2);
 
-      const diffs = recalculateDifferences(data1, data2, hexdumpSize);
-      setDifferences(diffs);
-      setCurrentDiffIndex(0);
+      setOffsetBytes(0);
+      // Default references are "other panel", so both sides are the mutual
+      // cross diff (mirror images).
+      setLeftDiffs(recalculateDifferences(data1, data2, hexdumpSize, 0).map((d) => ({ ...d, side: "left" as const })));
+      setRightDiffs(recalculateDifferences(data2, data1, hexdumpSize, 0).map((d) => ({ ...d, side: "right" as const })));
+      setLeftIdx(0);
+      setRightIdx(0);
       setShowCompareView(true);
     } catch (error) {
       console.error("Error comparing versions:", error);
@@ -824,14 +1007,32 @@ export function CompareModal({
     }
   };
 
-  // Recalculate differences when size changes
+  // Recalculate differences when the size OR the alignment offset changes.
+  // Debounced so scrolling to a new offset (unlocked) doesn't recompute the
+  // full diff on every row — the per-cell colours update instantly regardless.
+  // Each side has its own diff set (its display vs its reference) and its own
+  // counter, recomputed whenever anything relevant changes.
   useEffect(() => {
-    if (showCompareView && version1Data.length > 0 && version2Data.length > 0) {
-      const diffs = recalculateDifferences(version1Data, version2Data, hexdumpSize);
-      setDifferences(diffs);
-      setCurrentDiffIndex(0);
-    }
-  }, [hexdumpSize, showCompareView, version1Data, version2Data, recalculateDifferences]);
+    if (!showCompareView || version1Data.length === 0) return;
+    const id = setTimeout(() => {
+      const ref1 = refVersion1 === OTHER_SIDE ? version2Data : refData1;
+      const off1 = refVersion1 === OTHER_SIDE ? offsetBytes : 0;
+      const ref2 = refVersion2 === OTHER_SIDE ? version1Data : refData2;
+      const off2 = refVersion2 === OTHER_SIDE ? -offsetBytes : 0;
+
+      const left = ref1.length > 0
+        ? recalculateDifferences(version1Data, ref1, hexdumpSize, off1).map((d) => ({ ...d, side: "left" as const }))
+        : [];
+      const right = ref2.length > 0
+        ? recalculateDifferences(version2Data, ref2, hexdumpSize, off2).map((d) => ({ ...d, side: "right" as const }))
+        : [];
+      setLeftDiffs(left);
+      setRightDiffs(right);
+      setLeftIdx((i) => Math.max(0, Math.min(i, left.length - 1)));
+      setRightIdx((i) => Math.max(0, Math.min(i, right.length - 1)));
+    }, 120);
+    return () => clearTimeout(id);
+  }, [hexdumpSize, offsetBytes, showCompareView, version1Data, version2Data, refData1, refData2, refVersion1, refVersion2, recalculateDifferences]);
 
   // Initialize visible range when compare view opens and set up native scroll listeners
   useEffect(() => {
@@ -841,7 +1042,9 @@ export function CompareModal({
       if (container) {
         const containerHeight = container.clientHeight || 400;
         const endRow = Math.ceil(containerHeight / ROW_HEIGHT) + OVERSCAN;
-        setVisibleRange({ start: 0, end: Math.ceil(endRow / RANGE_CHUNK) * RANGE_CHUNK });
+        const initial = { start: 0, end: Math.ceil(endRow / RANGE_CHUNK) * RANGE_CHUNK };
+        setVisibleRange1(initial);
+        setVisibleRange2(initial);
       }
     }
   }, [showCompareView]);
@@ -849,72 +1052,139 @@ export function CompareModal({
   // Calculate bytes per row based on size (8 values * bytesPerValue)
   const bytesPerRow = hexdumpSize === "8b" ? VALUES_PER_ROW : VALUES_PER_ROW * 2;
 
-  // Navigate differences
-  const goToDifference = useCallback((index: number) => {
-    if (index < 0 || index >= differences.length) return;
-    setCurrentDiffIndex(index);
+  // Effective reference bytes + alignment offset for each side. "Other panel"
+  // references track the opposite display and use the visual scroll offset; a
+  // specific-file reference (e.g. own Ori) is compared at the same address.
+  const effRef1 = refVersion1 === OTHER_SIDE ? version2Data : refData1;
+  const effRef2 = refVersion2 === OTHER_SIDE ? version1Data : refData2;
+  const offL = refVersion1 === OTHER_SIDE ? offsetBytes : 0;
+  const offR = refVersion2 === OTHER_SIDE ? -offsetBytes : 0;
 
-    // Scroll so the difference is vertically centered
-    const diff = differences[index];
-    const rowIndex = Math.floor(diff.address / bytesPerRow);
-    const visibleHeight = scrollRef1.current?.clientHeight ?? 200;
-    const scrollTop = rowIndex * ROW_HEIGHT - visibleHeight / 2 + ROW_HEIGHT / 2;
-
-    if (scrollRef1.current) {
-      scrollRef1.current.scrollTop = Math.max(0, scrollTop);
+  // Change the file a side DISPLAYS (dropdown 1). Reloads that panel; the diff
+  // recompute is handled by the effect below.
+  const changeDisplay = async (side: "left" | "right", id: string) => {
+    if (side === "left") setSelectedVersion1(id); else setSelectedVersion2(id);
+    if (!id) return;
+    setIsComparing(true);
+    try {
+      const d = await loadVersionData(id);
+      if (side === "left") setVersion1Data(d); else setVersion2Data(d);
+      setAreaSel(null);
+      setFoundMatch(null);
+    } catch (error) {
+      console.error("changeDisplay error:", error);
+    } finally {
+      setIsComparing(false);
     }
-    if (scrollRef2.current) {
-      scrollRef2.current.scrollTop = Math.max(0, scrollTop);
-    }
-  }, [differences, bytesPerRow]);
+  };
 
-  const goToPrevDiff = useCallback(() => {
-    if (differences.length === 0) return;
-
-    // If user clicked somewhere, find previous diff from that position
-    if (selectedAddress !== null) {
-      const prevDiffIndex = [...differences].reverse().findIndex(d => d.address < selectedAddress);
-      if (prevDiffIndex !== -1) {
-        const actualIndex = differences.length - 1 - prevDiffIndex;
-        goToDifference(actualIndex);
-        setSelectedAddress(null); // Clear selection after navigation
-        return;
-      }
-      // No diff before, wrap to last
-      goToDifference(differences.length - 1);
-      setSelectedAddress(null);
+  // Change a side's comparison REFERENCE (dropdown 2). OTHER_SIDE keeps it
+  // pointed at the opposite panel; a specific id loads that file as the
+  // reference for this side.
+  const changeReference = async (side: "left" | "right", id: string) => {
+    if (side === "left") setRefVersion1(id); else setRefVersion2(id);
+    if (id === OTHER_SIDE) {
+      if (side === "left") setRefData1([]); else setRefData2([]);
       return;
     }
-
-    // Normal navigation
-    const newIndex = currentDiffIndex > 0 ? currentDiffIndex - 1 : differences.length - 1;
-    goToDifference(newIndex);
-  }, [differences, selectedAddress, currentDiffIndex, goToDifference]);
-
-  const goToNextDiff = useCallback(() => {
-    if (differences.length === 0) return;
-
-    // If user clicked somewhere, find next diff from that position
-    if (selectedAddress !== null) {
-      const nextDiffIndex = differences.findIndex(d => d.address > selectedAddress);
-      if (nextDiffIndex !== -1) {
-        goToDifference(nextDiffIndex);
-        setSelectedAddress(null); // Clear selection after navigation
-        return;
-      }
-      // No diff after, wrap to first
-      goToDifference(0);
-      setSelectedAddress(null);
-      return;
+    setIsComparing(true);
+    try {
+      const d = await loadVersionData(id);
+      if (side === "left") setRefData1(d); else setRefData2(d);
+    } catch (error) {
+      console.error("changeReference error:", error);
+    } finally {
+      setIsComparing(false);
     }
+  };
 
-    // Normal navigation
-    const newIndex = currentDiffIndex < differences.length - 1 ? currentDiffIndex + 1 : 0;
-    goToDifference(newIndex);
-  }, [differences, selectedAddress, currentDiffIndex, goToDifference]);
+  // Find the selected area in the OTHER file: search its bytes, highlight the
+  // match, then align both panels on it and lock the sync at that offset.
+  const findSelectionInOther = () => {
+    if (!areaSel) return;
+    const bpv = hexdumpSize === "8b" ? 1 : 2;
+    const startByte = Math.min(areaSel.start, areaSel.end);
+    const endByte = Math.max(areaSel.start, areaSel.end) + bpv - 1;
+    const srcData = areaSel.side === "left" ? version1Data : version2Data;
+    const otherData = areaSel.side === "left" ? version2Data : version1Data;
+    const needle = srcData.slice(startByte, endByte + 1);
+    if (needle.length < 2) { setFindMsg((t.compare as any).selectAreaFirst || "Select a larger area first"); return; }
 
-  // Keyboard: Escape closes the modal (open version menus swallow it first),
-  // Left/Right arrows navigate differences in compare view.
+    const idx = findBytes(otherData, needle, 0);
+    if (idx === -1) { setFoundMatch(null); setFindMsg((t.compare as any).noMatchArea || "No matching area found"); return; }
+
+    const otherSide: "left" | "right" = areaSel.side === "left" ? "right" : "left";
+    setFoundMatch({ side: otherSide, start: idx, end: idx + needle.length - 1 });
+    setFindMsg(null);
+
+    // Exact byte alignment: left cell A pairs with right cell A + alignOffset.
+    // When the selection is on the left, the match at `idx` on the right sits
+    // where the selection at `startByte` on the left should align, so
+    // alignOffset = idx - startByte; mirrored when the selection is on the right.
+    const alignOffset = areaSel.side === "left" ? idx - startByte : startByte - idx;
+
+    // Visual sync delta (pixels) rounded to the nearest row — rows are the finest
+    // the panels can scroll to; the diff coloring still uses the exact byte
+    // offset above, so alignment is byte-accurate even when it isn't row-aligned.
+    const deltaRows = Math.round(alignOffset / bytesPerRow);
+    scrollDeltaRef.current = deltaRows * ROW_HEIGHT;
+
+    // Center the SOURCE selection, then derive the other panel from the delta so
+    // both stay in lockstep (centering each independently would drift apart when
+    // one hits the max(0,…) clamp near the file start). Clamp the PAIR: if either
+    // top goes negative, lift both equally so their relative offset is preserved.
+    const h = scrollRef1.current?.clientHeight ?? 300;
+    const srcPos = areaSel.side === "left" ? startByte : idx;
+    const srcTop = Math.floor(srcPos / bytesPerRow) * ROW_HEIGHT - h / 2 + ROW_HEIGHT / 2;
+    let leftTop = areaSel.side === "left" ? srcTop : srcTop - scrollDeltaRef.current;
+    let rightTop = areaSel.side === "left" ? srcTop + scrollDeltaRef.current : srcTop;
+    const lift = Math.min(leftTop, rightTop);
+    if (lift < 0) { leftTop -= lift; rightTop -= lift; }
+
+    // Lock at the exact byte offset. Set the ref BEFORE moving the panels so the
+    // scroll events from the assignments already see "locked" and don't re-derive
+    // (round) the offset.
+    syncedRef.current = true;
+    if (scrollRef1.current) scrollRef1.current.scrollTop = leftTop;
+    if (scrollRef2.current) scrollRef2.current.scrollTop = rightTop;
+    setScrollSynced(true);
+    setOffsetBytes(alignOffset);
+    setLockOffsetBytes(alignOffset);
+    updatePanelRange(scrollRef1.current, setVisibleRange1, ticking1);
+    updatePanelRange(scrollRef2.current, setVisibleRange2, ticking2);
+  };
+
+  // Navigate a given side's differences: center that panel on the diff, the
+  // other panel follows at the locked offset.
+  const goToDiff = useCallback((side: "left" | "right", index: number) => {
+    const list = side === "left" ? leftDiffs : rightDiffs;
+    if (index < 0 || index >= list.length) return;
+    if (side === "left") setLeftIdx(index); else setRightIdx(index);
+
+    const rowIndex = Math.floor(list[index].address / bytesPerRow);
+    const h = scrollRef1.current?.clientHeight ?? 200;
+    const base = Math.max(0, rowIndex * ROW_HEIGHT - h / 2 + ROW_HEIGHT / 2);
+    const follow = scrollSynced ? scrollDeltaRef.current : 0;
+    if (side === "right") {
+      if (scrollRef2.current) scrollRef2.current.scrollTop = base;
+      if (scrollRef1.current) scrollRef1.current.scrollTop = Math.max(0, base - follow);
+    } else {
+      if (scrollRef1.current) scrollRef1.current.scrollTop = base;
+      if (scrollRef2.current) scrollRef2.current.scrollTop = Math.max(0, base + follow);
+    }
+    updatePanelRange(scrollRef1.current, setVisibleRange1, ticking1);
+    updatePanelRange(scrollRef2.current, setVisibleRange2, ticking2);
+  }, [leftDiffs, rightDiffs, bytesPerRow, scrollSynced, updatePanelRange]);
+
+  const stepDiff = useCallback((side: "left" | "right", dir: 1 | -1) => {
+    const list = side === "left" ? leftDiffs : rightDiffs;
+    if (list.length === 0) return;
+    const cur = side === "left" ? leftIdx : rightIdx;
+    const next = dir > 0 ? (cur < list.length - 1 ? cur + 1 : 0) : (cur > 0 ? cur - 1 : list.length - 1);
+    goToDiff(side, next);
+  }, [leftDiffs, rightDiffs, leftIdx, rightIdx, goToDiff]);
+
+  // Keyboard: Escape closes; Left/Right arrows step the LEFT panel's diffs.
   useEffect(() => {
     if (!isOpen) return;
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -922,31 +1192,53 @@ export function CompareModal({
         onClose();
       } else if (showCompareView && e.key === 'ArrowLeft') {
         e.preventDefault();
-        goToPrevDiff();
+        stepDiff("left", -1);
       } else if (showCompareView && e.key === 'ArrowRight') {
         e.preventDefault();
-        goToNextDiff();
+        stepDiff("left", 1);
       }
     };
     document.addEventListener('keydown', handleKeyDown);
     return () => document.removeEventListener('keydown', handleKeyDown);
-  }, [isOpen, showCompareView, onClose, goToPrevDiff, goToNextDiff]);
+  }, [isOpen, showCompareView, onClose, stepDiff]);
 
   // Synchronized scrolling - update virtualization immediately during scroll
   const handleScroll = (source: "left" | "right") => {
-    const sourceRef = source === "left" ? scrollRef1.current : scrollRef2.current;
-    const targetRef = source === "left" ? scrollRef2.current : scrollRef1.current;
+    const leftRef = scrollRef1.current;
+    const rightRef = scrollRef2.current;
+    const sourceRef = source === "left" ? leftRef : rightRef;
 
-    // Always update virtualization for the scrolling container
-    handleVirtualScroll(sourceRef);
+    // Update the scrolling panel's own virtualization range.
+    updatePanelRange(
+      sourceRef,
+      source === "left" ? setVisibleRange1 : setVisibleRange2,
+      source === "left" ? ticking1 : ticking2
+    );
 
-    // Sync the other panel (with guard to prevent infinite loop)
-    if (!isScrolling.current && sourceRef && targetRef) {
+    // When locked, keep the other panel at the frozen relative offset.
+    if (scrollSynced && !isScrolling.current && leftRef && rightRef) {
       isScrolling.current = true;
-      targetRef.scrollTop = sourceRef.scrollTop;
+      const delta = scrollDeltaRef.current;
+      if (source === "left") {
+        rightRef.scrollTop = leftRef.scrollTop + delta;
+        updatePanelRange(rightRef, setVisibleRange2, ticking2);
+      } else {
+        leftRef.scrollTop = rightRef.scrollTop - delta;
+        updatePanelRange(leftRef, setVisibleRange1, ticking1);
+      }
       requestAnimationFrame(() => {
         isScrolling.current = false;
       });
+    }
+
+    // While UNLOCKED, track the live alignment offset (quantized to rows) so the
+    // differences reflect how the panels are aligned right now. While LOCKED the
+    // offset is frozen — set by the lock toggle or, byte-exact, by "Find in
+    // other" — so we must NOT recompute it here (that would round it to a row
+    // and undo an exact match alignment).
+    if (leftRef && rightRef && !syncedRef.current) {
+      const ob = Math.round((rightRef.scrollTop - leftRef.scrollTop) / ROW_HEIGHT) * bytesPerRow;
+      setOffsetBytes((prev) => (prev === ob ? prev : ob));
     }
 
     // Indicateur de viewport de la minimap (style direct, déclaré plus bas —
@@ -1023,19 +1315,9 @@ export function CompareModal({
     document.removeEventListener("mouseup", handleResizeEnd);
   };
 
-  // Create difference address set for highlighting - memoized
-  const diffAddresses = useMemo(() => {
-    const set = new Set<number>();
-    const bytesPerValue = hexdumpSize === "8b" ? 1 : 2;
-    differences.forEach((d) => {
-      for (let i = 0; i < bytesPerValue; i++) {
-        set.add(d.address + i);
-      }
-    });
-    return set;
-  }, [differences, hexdumpSize]);
 
-  const currentDiffAddress = differences[currentDiffIndex]?.address ?? -1;
+  const leftCurAddr = leftDiffs[leftIdx]?.address ?? -1;
+  const rightCurAddr = rightDiffs[rightIdx]?.address ?? -1;
 
   // Calculate total rows
   const totalRows = useMemo(() => {
@@ -1158,14 +1440,14 @@ export function CompareModal({
         }
       }
     };
-    for (const d of differences) {
+    for (const d of [...leftDiffs, ...rightDiffs]) {
       const p = Math.min(totalPx - 1, Math.floor((d.address / dataLen) * totalPx));
       if (d.value2 >= d.value1) mark(p, 255, 82, 82);
       else mark(p, 77, 163, 255);
     }
     ctx.putImageData(img, 0, 0);
     updateMinimapViewport();
-  }, [showCompareView, version1Data, version2Data, differences, minimapSize, theme, updateMinimapViewport]);
+  }, [showCompareView, version1Data, version2Data, leftDiffs, rightDiffs, minimapSize, theme, updateMinimapViewport]);
 
   // Clic / glisser dans la minimap : navigue les DEUX panneaux (sync)
   const handleMinimapMouseDown = useCallback((e: React.MouseEvent) => {
@@ -1183,7 +1465,9 @@ export function CompareModal({
       const frac = Math.min(1, Math.max(0, (clientY - rect.top) / rect.height));
       const top = frac * totalH - sc1.clientHeight / 2;
       sc1.scrollTop = top;
-      if (sc2) sc2.scrollTop = top;
+      // Follow at the locked offset; when unlocked, panel2 also tracks the
+      // minimap (the minimap represents the shared file position).
+      if (sc2) sc2.scrollTop = top + (scrollSynced ? scrollDeltaRef.current : 0);
     };
     scrollTo(e.clientY);
     const onMove = (ev: MouseEvent) => scrollTo(ev.clientY);
@@ -1193,7 +1477,7 @@ export function CompareModal({
     };
     document.addEventListener('mousemove', onMove);
     document.addEventListener('mouseup', onUp);
-  }, [totalRows]);
+  }, [totalRows, scrollSynced]);
 
   // Ligne d'en-têtes d'offsets (même langage que l'hexdump), alignée sur la
   // grille des valeurs de chaque panneau (gap-2 + adresse 3rem + cellules).
@@ -1221,13 +1505,15 @@ export function CompareModal({
   // rows they concern
   const renderRows = (data: number[], side: "left" | "right") => {
     const rows: JSX.Element[] = [];
-    const end = Math.min(visibleRange.end, totalRows);
-    for (let rowIndex = visibleRange.start; rowIndex < end; rowIndex++) {
+    const range = side === "left" ? visibleRange1 : visibleRange2;
+    const end = Math.min(range.end, totalRows);
+    for (let rowIndex = range.start; rowIndex < end; rowIndex++) {
       const startByte = rowIndex * bytesPerRow;
       const endByte = startByte + bytesPerRow - 1;
 
-      const rowCurrentDiff = currentDiffAddress >= startByte && currentDiffAddress <= endByte
-        ? currentDiffAddress : -1;
+      // Highlight this side's own current diff on this side's rows.
+      const cd = side === "left" ? leftCurAddr : rightCurAddr;
+      const rowCurrentDiff = cd >= startByte && cd <= endByte ? cd : -1;
       const rowSelected = selectedAddress !== null && selectedAddress >= startByte && selectedAddress <= endByte
         ? selectedAddress : -1;
       const rowHoveredMap = hoveredMapRegion &&
@@ -1235,12 +1521,20 @@ export function CompareModal({
         hoveredMapRegion.address + hoveredMapRegion.size - 1 >= startByte
           ? hoveredMapRegion.address : null;
 
+      // Only highlight an actual drag (start !== end), not a plain click.
+      const areaOnThisSide = areaSel && areaSel.side === side && areaSel.start !== areaSel.end;
+      const rowAreaStart = areaOnThisSide ? Math.min(areaSel!.start, areaSel!.end) : -1;
+      const rowAreaEnd = areaOnThisSide ? Math.max(areaSel!.start, areaSel!.end) : -1;
+      const foundOnThisSide = foundMatch && foundMatch.side === side;
+      const rowFoundStart = foundOnThisSide ? foundMatch!.start : -1;
+      const rowFoundEnd = foundOnThisSide ? foundMatch!.end : -1;
+
       rows.push(
         <CompareRow
           key={rowIndex}
           rowIndex={rowIndex}
           data={data}
-          otherData={side === "left" ? version2Data : version1Data}
+          otherData={side === "left" ? effRef1 : effRef2}
           side={side}
           theme={theme}
           hexdumpSize={hexdumpSize}
@@ -1248,12 +1542,18 @@ export function CompareModal({
           hexdumpFormat={hexdumpFormat}
           bytesPerRow={bytesPerRow}
           byteToMapInfo={byteToMapInfo}
-          diffAddresses={diffAddresses}
+          offsetBytes={side === "left" ? offL : offR}
           currentDiffAddress={rowCurrentDiff}
           selectedAddress={rowSelected}
           hoveredMapAddress={rowHoveredMap}
+          areaStart={rowAreaStart}
+          areaEnd={rowAreaEnd}
+          foundStart={rowFoundStart}
+          foundEnd={rowFoundEnd}
           onSelectAddress={handleSelectAddress}
           onHoverMap={handleHoverMap}
+          onAreaDown={handleAreaDown}
+          onAreaEnter={handleAreaEnter}
         />
       );
     }
@@ -1261,9 +1561,6 @@ export function CompareModal({
   };
 
   if (!isOpen) return null;
-
-  const getVersion1Name = () => displayVersions.find((v) => v.id === selectedVersion1)?.name || "";
-  const getVersion2Name = () => displayVersions.find((v) => v.id === selectedVersion2)?.name || "";
 
   return (
     <div className="fixed inset-0 z-[9999] flex items-center justify-center backdrop-blur-sm" style={{ backgroundColor: '#000000a2' }}>
@@ -1323,40 +1620,35 @@ export function CompareModal({
               {t.compare.binaryOnlyNotice}
             </p>
 
-            <div className="flex gap-3 items-center">
-              {/* Left version */}
+            <div className="flex gap-3 items-end">
               <VersionSelect
                 label={t.compare.left}
                 placeholder={t.compare.selectVersion}
-                versions={displayVersions}
+                versions={allFileOptions}
                 selectedId={selectedVersion1}
-                disabledId={selectedVersion2}
+                disabledId=""
                 currentBadge={t.compare.currentBadge}
                 theme={theme}
                 onSelect={setSelectedVersion1}
               />
-
-              {/* Swap button */}
               <button
                 onClick={() => {
                   const temp = selectedVersion1;
                   setSelectedVersion1(selectedVersion2);
                   setSelectedVersion2(temp);
                 }}
-                className={`p-2 rounded transition-colors mt-5 flex-shrink-0 ${getButtonHoverClass()}`}
+                className={`p-2 rounded transition-colors mb-1 flex-shrink-0 ${getButtonHoverClass()}`}
                 style={{ color: theme === "light" ? "#666666" : "#999999" }}
                 title={t.compare.swapVersions}
               >
                 <ArrowLeftRight className="w-4 h-4" />
               </button>
-
-              {/* Right version */}
               <VersionSelect
                 label={t.compare.right}
                 placeholder={t.compare.selectVersion}
-                versions={displayVersions}
+                versions={allFileOptions}
                 selectedId={selectedVersion2}
-                disabledId={selectedVersion1}
+                disabledId=""
                 currentBadge={t.compare.currentBadge}
                 theme={theme}
                 onSelect={setSelectedVersion2}
@@ -1392,26 +1684,49 @@ export function CompareModal({
         ) : (
           // Compare view
           <div className="flex-1 flex flex-col overflow-hidden">
-            {/* Version headers */}
+            {/* Per side: the DISPLAYED file (dropdown 1) and what it is COMPARED
+                TO (dropdown 2 — the other panel, or a specific file such as its
+                own Ori). Each panel is coloured by its own display-vs-reference,
+                and any change recounts the differences. */}
             <div className="flex flex-shrink-0" style={{ borderBottom: `1px solid ${hairline}` }}>
-              <div
-                className="flex-1 px-3 py-1.5 text-[11px] font-semibold text-center"
-                style={{
-                  background: theme === "light" ? "#fee2e2" : "rgba(239, 68, 68, 0.2)",
-                  color: theme === "light" ? "#991b1b" : "#fca5a5",
-                }}
-              >
-                {getVersion1Name()}
-              </div>
-              <div
-                className="flex-1 px-3 py-1.5 text-[11px] font-semibold text-center"
-                style={{
-                  background: theme === "light" ? "#dcfce7" : "rgba(34, 197, 94, 0.2)",
-                  color: theme === "light" ? "#166534" : "#86efac",
-                }}
-              >
-                {getVersion2Name()}
-              </div>
+              {(["left", "right"] as const).map((side) => {
+                const dispId = side === "left" ? selectedVersion1 : selectedVersion2;
+                const refId = side === "left" ? refVersion1 : refVersion2;
+                const refDtos: VersionDto[] = [
+                  { id: OTHER_SIDE, fileId: "", name: (t.compare as any).otherPanel || "↔ Other panel", isCurrent: false, createdAt: "" },
+                  ...allFileOptions,
+                ];
+                return (
+                  <div
+                    key={side}
+                    className="flex-1 min-w-0 px-2 py-1 flex items-center gap-1.5"
+                    style={{ background: side === "left"
+                      ? (theme === "light" ? "#fee2e2" : "rgba(239, 68, 68, 0.2)")
+                      : (theme === "light" ? "#dcfce7" : "rgba(34, 197, 94, 0.2)") }}
+                  >
+                    <VersionSelect
+                      label=""
+                      placeholder={t.compare.selectVersion}
+                      versions={allFileOptions}
+                      selectedId={dispId}
+                      disabledId=""
+                      currentBadge={t.compare.currentBadge}
+                      theme={theme}
+                      onSelect={(id) => changeDisplay(side, id)}
+                    />
+                    <VersionSelect
+                      label=""
+                      placeholder={(t.compare as any).compareTo || "Compare to"}
+                      versions={refDtos}
+                      selectedId={refId}
+                      disabledId=""
+                      currentBadge={t.compare.currentBadge}
+                      theme={theme}
+                      onSelect={(id) => changeReference(side, id)}
+                    />
+                  </div>
+                );
+              })}
             </div>
 
             {/* Dual hexdump view — scrollbars natives masquées, une minimap
@@ -1540,8 +1855,8 @@ export function CompareModal({
                 </div>
               </div>
 
-              {/* Center: Navigation */}
-              <div className="flex items-center gap-3">
+              {/* Center: back + a diff counter/navigator PER SIDE */}
+              <div className="flex items-center gap-2">
                 <button
                   onClick={() => setShowCompareView(false)}
                   className={`p-1 rounded transition-colors ${getButtonHoverClass()}`}
@@ -1554,57 +1869,87 @@ export function CompareModal({
                   <ChevronLeft className="w-4 h-4" />
                 </button>
 
-                <button
-                  onClick={goToPrevDiff}
-                  disabled={differences.length === 0}
-                  className={`p-1 rounded transition-colors disabled:opacity-50 ${getButtonHoverClass()}`}
-                  style={{
-                    color: theme === "light" ? "#666666" : "#999999",
-                    border: `1px solid ${theme === "light" ? "#dee2e6" : "rgba(255, 255, 255, 0.2)"}`,
-                  }}
-                  title={t.compare.previousDiff}
-                >
-                  <ChevronLeft className="w-4 h-4" />
-                </button>
-
-                <span
-                  className="text-[11px] font-mono min-w-[140px] text-center"
-                  style={{ color: theme === "light" ? "#000000" : "#ffffff" }}
-                >
-                  {differences.length > 0 ? (
-                    <>
-                      {currentDiffIndex + 1} / {differences.length} {t.compare.differences}
-                    </>
-                  ) : (
-                    t.compare.noDifferences
-                  )}
-                </span>
-
-                <button
-                  onClick={goToNextDiff}
-                  disabled={differences.length === 0}
-                  className={`p-1 rounded transition-colors disabled:opacity-50 ${getButtonHoverClass()}`}
-                  style={{
-                    color: theme === "light" ? "#666666" : "#999999",
-                    border: `1px solid ${theme === "light" ? "#dee2e6" : "rgba(255, 255, 255, 0.2)"}`,
-                  }}
-                  title={t.compare.nextDiff}
-                >
-                  <ChevronRight className="w-4 h-4" />
-                </button>
-
-                {differences.length > 0 && (
-                  <span
-                    className="text-[10px] font-mono"
-                    style={{ color: theme === "light" ? "#666666" : "#999999" }}
-                  >
-                    @ {differences[currentDiffIndex]?.address.toString(16).toUpperCase().padStart(5, "0")}
-                  </span>
-                )}
+                {(["left", "right"] as const).map((side) => {
+                  const list = side === "left" ? leftDiffs : rightDiffs;
+                  const idx = side === "left" ? leftIdx : rightIdx;
+                  const accent = side === "left"
+                    ? (theme === "light" ? "#c62828" : "#fca5a5")
+                    : (theme === "light" ? "#166534" : "#86efac");
+                  const border = side === "left" ? "rgba(239,68,68,0.4)" : "rgba(34,197,94,0.4)";
+                  return (
+                    <div key={side} className="flex items-center gap-0.5 pl-0.5 pr-1 rounded" style={{ border: `1px solid ${border}` }}>
+                      <button
+                        onClick={() => stepDiff(side, -1)}
+                        disabled={list.length === 0}
+                        className={`p-1 rounded transition-colors disabled:opacity-40 ${getButtonHoverClass()}`}
+                        style={{ color: accent }}
+                        title={t.compare.previousDiff}
+                      >
+                        <ChevronLeft className="w-4 h-4" />
+                      </button>
+                      <span
+                        className="text-[11px] font-mono min-w-[74px] text-center"
+                        style={{ color: accent }}
+                        title={list.length > 0 ? `@ 0x${list[idx]?.address.toString(16).toUpperCase()}` : t.compare.noDifferences}
+                      >
+                        {side === "left" ? "L " : "R "}
+                        {list.length > 0 ? `${idx + 1}/${list.length}` : "0"}
+                      </span>
+                      <button
+                        onClick={() => stepDiff(side, 1)}
+                        disabled={list.length === 0}
+                        className={`p-1 rounded transition-colors disabled:opacity-40 ${getButtonHoverClass()}`}
+                        style={{ color: accent }}
+                        title={t.compare.nextDiff}
+                      >
+                        <ChevronRight className="w-4 h-4" />
+                      </button>
+                    </div>
+                  );
+                })}
               </div>
 
-              {/* Right: Spacer for balance */}
-              <div style={{ width: '150px' }} />
+              {/* Right: find-in-other + sync-scroll lock/unlock */}
+              <div className="flex items-center justify-end gap-2 flex-shrink-0">
+                {findMsg && (
+                  <span className="text-[10px]" style={{ color: theme === 'light' ? '#b45309' : '#fbbf24' }}>{findMsg}</span>
+                )}
+                <button
+                  onClick={findSelectionInOther}
+                  disabled={!areaSel || areaSel.start === areaSel.end}
+                  title={(t.compare as any).findAreaHint || "Select an area in one panel, then find the same bytes in the other file"}
+                  className={`flex items-center gap-1.5 px-2.5 h-7 rounded text-[11px] font-medium transition-colors disabled:opacity-40 ${getButtonHoverClass()}`}
+                  style={{
+                    color: theme === 'light' ? '#5b21b6' : '#c4b5fd',
+                    background: theme === 'light' ? 'rgba(124,58,237,0.1)' : 'rgba(124,58,237,0.18)',
+                    border: '1px solid rgba(124,58,237,0.45)',
+                  }}
+                >
+                  {(t.compare as any).findArea || "Find in other"}
+                </button>
+                {scrollSynced && lockOffsetBytes !== 0 && (
+                  <span className="text-[10px] font-mono" style={{ color: theme === 'light' ? '#666666' : '#999999' }}>
+                    {lockOffsetBytes > 0 ? '+' : ''}0x{Math.abs(lockOffsetBytes).toString(16).toUpperCase()}
+                  </span>
+                )}
+                <button
+                  onClick={toggleScrollSync}
+                  title={scrollSynced
+                    ? "Sync-scroll locked — click to scroll each side independently"
+                    : "Scroll each side to align, then click to lock sync at this offset"}
+                  className={`flex items-center gap-1.5 px-2.5 h-7 rounded text-[11px] font-medium transition-colors ${getButtonHoverClass()}`}
+                  style={{
+                    color: scrollSynced ? (theme === 'light' ? '#166534' : '#86efac') : (theme === 'light' ? '#b45309' : '#fbbf24'),
+                    background: scrollSynced
+                      ? (theme === 'light' ? 'rgba(34,197,94,0.12)' : 'rgba(34,197,94,0.15)')
+                      : (theme === 'light' ? 'rgba(245,158,11,0.12)' : 'rgba(245,158,11,0.15)'),
+                    border: `1px solid ${scrollSynced ? 'rgba(34,197,94,0.4)' : 'rgba(245,158,11,0.45)'}`,
+                  }}
+                >
+                  {scrollSynced ? <Link2 className="w-3.5 h-3.5" /> : <Link2Off className="w-3.5 h-3.5" />}
+                  {scrollSynced ? "Synced" : "Lock"}
+                </button>
+              </div>
             </div>
           </div>
         )}

@@ -158,6 +158,47 @@ pub fn detect_maps(request: DetectMapsArgs) -> Result<DetectMapsResponse, String
     Ok(response)
 }
 
+/// Heuristic, family-agnostic scan for CANDIDATE tables ("potential maps").
+///
+/// Used for files the strict identifier does NOT recognize: the user can
+/// import the file anyway and inspect the candidates in the hexdump. The
+/// results are guesses (low confidence, raw values, category "Potential maps")
+/// and are NEVER mixed into the trusted detection of a supported ECU — the
+/// frontend keeps them in a separate `potential_maps` list, surfaced only as
+/// highlighted regions in the hexdump. Request/response shapes reuse
+/// DetectMapsArgs / DetectMapsResponse; `ecu_type` and `tuned_mode` are ignored.
+#[tauri::command]
+pub fn scan_potential_maps(request: DetectMapsArgs) -> Result<DetectMapsResponse, String> {
+    let start = Instant::now();
+    let data = decode_base64(&request.file_data_base64)?;
+
+    log::warn!(
+        "🔎 [SCAN-POTENTIAL] file: {} ({} bytes)",
+        request.file_name,
+        data.len()
+    );
+
+    let maps = crate::detector::generic::scan_potential_maps(&data);
+
+    let response = DetectMapsResponse {
+        success: true,
+        total_maps: maps.len(),
+        maps,
+        processing_time_ms: start.elapsed().as_millis(),
+        file_size: data.len(),
+        detector_version: DETECTOR_VERSION,
+        expected_maps: None,
+    };
+
+    log::warn!(
+        "✅ [SCAN-POTENTIAL] {} candidate map(s) in {}ms",
+        response.total_maps,
+        response.processing_time_ms
+    );
+
+    Ok(response)
+}
+
 /// Rapport de complétude EDC16 : familles de maps qui existent TOUJOURS dans
 /// un fichier de cette famille (invariants métier). Un compte insuffisant
 /// signale un fichier probablement déjà fortement modifié — l'app conseille

@@ -11,11 +11,12 @@ import { useRouter } from "next/navigation";
 import axios from "axios";
 import { MODAL_GLASS, MODAL_GLASS_LIGHT } from "@/lib/modal-glass";
 import { useThemeOptional } from "@/contexts/theme-context";
-import { identifyEcu, detectMaps } from "@/lib/local/detector";
+import { identifyEcu, detectMaps, scanPotentialMaps, SUPPORTED_ECUS, BETA_ECUS } from "@/lib/local/detector";
 import ZedGradientDefs, { ZedFileIcon } from "@/components/zed-gradient-defs";
 // Listes déroulantes au style de l'app (même composant que la langue des paramètres)
 import { StyledSelect } from "@/components/styled-select";
 import { lookupEcuBrand } from "@/lib/ecu-brand-db";
+import { CAR_BRANDS } from "@/lib/car-brands";
 
 interface ProjectCreatorProps {
   onProjectCreated?: (projectId: string) => void;
@@ -61,6 +62,12 @@ export function ProjectCreator({ onProjectCreated }: ProjectCreatorProps) {
   
   // Cached base64 file data (avoid re-encoding for detect call)
   const fileBase64Ref = useRef<string | null>(null);
+  // Synchronous re-entrancy guard: `isUploading` is React state and only
+  // disables the button on the next render, so rapid clicks (or clicks while
+  // the main thread is busy encoding/scanning a large file) can start several
+  // project creations at once — the "4 uploads" bug. A ref flips synchronously
+  // on the first call and blocks every re-entrant one until this one settles.
+  const isSubmittingRef = useRef(false);
 
   // Form state
   const [projectName, setProjectName] = useState("");
@@ -126,8 +133,11 @@ export function ProjectCreator({ onProjectCreated }: ProjectCreatorProps) {
       // Identify the ECU type via the embedded Rust detection engine
       const identResult = await identifyEcu(fileDataBase64, file.name);
 
-      // Check if this ECU type is enabled in the admin database
-      if (identResult?.ecu_type && identResult.ecu_type !== "Unknown") {
+      // Check if this ECU type is enabled in the admin database. Only for
+      // SUPPORTED families: a beta/unsupported type (e.g. EDC17C) is never in
+      // ecus.json, so this check would always report it "disabled" and wrongly
+      // wipe the identification — beta ECUs are handled by the scan path below.
+      if (identResult?.ecu_type && SUPPORTED_ECUS.has(identResult.ecu_type)) {
         try {
           const statusRes = await fetch(`/api/ecu-status?ecu_type=${encodeURIComponent(identResult.ecu_type)}`);
           if (statusRes.ok) {
@@ -185,7 +195,17 @@ export function ProjectCreator({ onProjectCreated }: ProjectCreatorProps) {
     setEcuIdentification(null);
   };
 
-  const handleCreateProject = async () => {
+  // `potentialScan` handles unrecognized files: instead of the strict family
+  // detection (which returns nothing for an Unknown ECU), it runs the generic
+  // heuristic scanner and stores the candidates in `potential_maps`. The
+  // project is created with ecu_type "unknown" and the candidates surface only
+  // as highlighted regions in the editor's hexdump.
+  const handleCreateProject = async (opts?: { potentialScan?: boolean }) => {
+    const potentialScan = opts?.potentialScan === true;
+
+    // A creation is already in flight — ignore this click entirely.
+    if (isSubmittingRef.current) return;
+
     if (!selectedFile) {
       toast({
         title: t.errors.noFileSelected,
@@ -194,8 +214,8 @@ export function ProjectCreator({ onProjectCreated }: ProjectCreatorProps) {
       return;
     }
 
-    // Block if ECU is disabled
-    if (ecuIdentification?.ecu_type && ecuIdentification.ecu_type !== "Unknown") {
+    // Block if ECU is disabled (skipped for an explicit "import anyway" scan)
+    if (!potentialScan && ecuIdentification?.ecu_type && ecuIdentification.ecu_type !== "Unknown") {
       try {
         const statusRes = await fetch(`/api/ecu-status?ecu_type=${encodeURIComponent(ecuIdentification.ecu_type)}`);
         if (statusRes.ok) {
@@ -220,6 +240,7 @@ export function ProjectCreator({ onProjectCreated }: ProjectCreatorProps) {
       return;
     }
 
+    isSubmittingRef.current = true;
     setIsUploading(true);
 
     try {
@@ -236,13 +257,41 @@ export function ProjectCreator({ onProjectCreated }: ProjectCreatorProps) {
         fileDataBase64 = btoa(chunks.join(''));
       }
 
-      // Run map detection via the embedded Rust detection engine
-      const detectionResults = await detectMaps({
-        fileDataBase64,
-        fileName: selectedFile.name,
-        ecuType: ecuIdentification?.ecu_type || "unknown",
-      });
+      // Recognized ECU → strict family detection. Unrecognized file imported
+      // via "scan for potential maps" → generic heuristic scan, results kept
+      // in `potential_maps` (empty trusted `maps`, so nothing masquerades as a
+      // verified map).
+      let detectionResults: any;
+      if (potentialScan) {
+        const scan = await scanPotentialMaps({
+          fileDataBase64,
+          fileName: selectedFile.name,
+        });
+        detectionResults = {
+          maps: [],
+          total_maps: 0,
+          processing_time_ms: scan.processing_time_ms,
+          file_size: scan.file_size,
+          detector_version: scan.detector_version,
+          potential_maps: scan.maps,
+        };
+      } else {
+        detectionResults = await detectMaps({
+          fileDataBase64,
+          fileName: selectedFile.name,
+          ecuType: ecuIdentification?.ecu_type || "unknown",
+        });
+      }
       const response = { data: detectionResults };
+      // A BETA family (e.g. EDC17) keeps its real ECU type on the project even
+      // though its maps come from the scanner — so later version imports pass
+      // the identity check (same type on both sides) instead of comparing
+      // against an anonymous "unknown".
+      const projectEcuType = potentialScan
+        ? (ecuIdentification && BETA_ECUS.has(ecuIdentification.ecu_type)
+            ? ecuIdentification.ecu_type
+            : "unknown")
+        : ecuIdentification?.ecu_type || "unknown";
       // Clear any stale project data BEFORE attempting versioning
       // This prevents navigating to editor with stale data if versioning fails
       if (typeof window !== 'undefined') {
@@ -258,7 +307,7 @@ export function ProjectCreator({ onProjectCreated }: ProjectCreatorProps) {
           fileName: selectedFile.name,
           fileData: fileDataBase64, // Base64 encoded binary data for PocketBase storage
           fileSize: selectedFile.size,
-          ecuType: ecuIdentification?.ecu_type || "unknown",
+          ecuType: projectEcuType,
           hardwareVersion: ecuIdentification?.hardware_version,
           softwareVersion: ecuIdentification?.software_version,
           detectionResults: response.data,
@@ -289,6 +338,7 @@ export function ProjectCreator({ onProjectCreated }: ProjectCreatorProps) {
           description: `${t.errors.creationErrorDescription}${detail ? ` — ${detail}` : ""}`,
           variant: "destructive",
         });
+        isSubmittingRef.current = false;
         setIsUploading(false);
         return; // Stop the process, don't navigate to editor without file data
       }
@@ -314,7 +364,7 @@ export function ProjectCreator({ onProjectCreated }: ProjectCreatorProps) {
         file_name: selectedFile.name,
         original_name: selectedFile.name,
         file_size: selectedFile.size,
-        ecu_type: ecuIdentification?.ecu_type || "unknown",
+        ecu_type: projectEcuType,
         hardware_version: ecuIdentification?.hardware_version,
         software_version: ecuIdentification?.software_version,
         project_name: projectName,
@@ -348,6 +398,9 @@ export function ProjectCreator({ onProjectCreated }: ProjectCreatorProps) {
         description: `${t.errors.uploadFailedDescription}${detail ? ` — ${detail}` : ""}`,
         variant: "destructive",
       });
+      // Failure — allow another attempt. On success we navigate away (the
+      // component unmounts) so the guard is intentionally left set.
+      isSubmittingRef.current = false;
     } finally {
       setIsUploading(false);
     }
@@ -434,14 +487,50 @@ export function ProjectCreator({ onProjectCreated }: ProjectCreatorProps) {
                     <p className="font-medium text-white">{t.upload?.analyzingEcu || "Analyzing ECU file..."}</p>
                   </div>
                 ) : ecuIdentification ? (
-                  ecuIdentification.ecu_type === "Unknown" ? (
+                  // Treat any identification that is NOT a supported family the
+                  // same as "not detected": the strict per-family detection has
+                  // nothing for it, so offer the generic "import anyway & scan"
+                  // path. This covers both a truly Unknown file and a recognized
+                  // but unsupported family (e.g. EDC17/MED17), which the negative
+                  // gate labels "not supported" — previously that landed in the
+                  // green "recognized" box and dead-ended at project creation.
+                  !SUPPORTED_ECUS.has(ecuIdentification.ecu_type) ? (
                     <div className="p-4 border rounded-lg bg-red-500/10 border-red-500/30">
                       <div className="flex items-center gap-3">
                         <AlertCircle className="w-6 h-6 flex-shrink-0 text-red-400" />
                         <p className="font-semibold leading-none text-white text-center flex-1">
-                          {t.upload?.ecuNotDetected || "ECU not detected. Check that the file is the correct size and is not encrypted."}
+                          {BETA_ECUS.has(ecuIdentification.ecu_type)
+                            ? `${ecuIdentification.manufacturer} ${ecuIdentification.variant || ecuIdentification.ecu_type} — ${t.upload?.ecuBetaHint || "beta support: no dedicated detector yet, so import and scan for potential maps."}`
+                            : ecuIdentification.ecu_type !== "Unknown"
+                            ? `${ecuIdentification.variant || `${ecuIdentification.manufacturer} ${ecuIdentification.ecu_type}`} — ${t.upload?.ecuUnsupportedHint || "not supported yet. You can import it anyway and scan for potential maps."}`
+                            : (t.upload?.ecuNotDetected || "ECU not detected. Check that the file is the correct size and is not encrypted.")}
                         </p>
                       </div>
+                      {/* Escape hatch for unsupported/unrecognized files: import
+                          anyway and run the family-agnostic heuristic scanner.
+                          The candidates it finds are shown as highlighted
+                          regions in the editor's hexdump, clearly marked as
+                          unverified — never treated as detected maps. */}
+                      <Button
+                        onClick={() => handleCreateProject({ potentialScan: true })}
+                        disabled={!projectName.trim() || isUploading || isAnalyzing}
+                        variant="outline"
+                        className="w-full mt-3 border-red-500/40 bg-black/20 hover:bg-black/30 text-white"
+                        size="sm"
+                      >
+                        {isUploading ? (
+                          <span className="inline-flex items-center">
+                            {(t.common?.uploading || "Uploading...").replace(/\.{3}$/, '')}
+                            <span className="inline-flex w-[18px]">
+                              <span className="animate-[dotPulse_1.4s_infinite] [animation-delay:0s]">.</span>
+                              <span className="animate-[dotPulse_1.4s_infinite] [animation-delay:0.2s]">.</span>
+                              <span className="animate-[dotPulse_1.4s_infinite] [animation-delay:0.4s]">.</span>
+                            </span>
+                          </span>
+                        ) : (
+                          t.upload?.importAndScan || "Import anyway & scan for potential maps"
+                        )}
+                      </Button>
                     </div>
                   ) : (
                     <div className={`p-4 border rounded-lg ${L ? "bg-green-600/10 border-green-600/30" : "bg-green-500/10 border-white-500/30"}`}>
@@ -503,10 +592,7 @@ export function ProjectCreator({ onProjectCreated }: ProjectCreatorProps) {
                   disabled={isUploading}
                   options={[
                     { value: "", label: t.upload?.select || "Select..." },
-                    { value: "Audi", label: "Audi" },
-                    { value: "Seat", label: "Seat" },
-                    { value: "Skoda", label: "Skoda" },
-                    { value: "Volkswagen", label: "Volkswagen" },
+                    ...CAR_BRANDS.map((b) => ({ value: b, label: b })),
                   ]}
                 />
               </div>
@@ -640,8 +726,11 @@ export function ProjectCreator({ onProjectCreated }: ProjectCreatorProps) {
           {/* Action Buttons */}
           <div className="flex gap-3 pt-4">
             <Button
-              onClick={handleCreateProject}
-              disabled={!selectedFile || !projectName.trim() || isUploading || isAnalyzing || ecuIdentification?.ecu_type === "Unknown"}
+              onClick={() => handleCreateProject()}
+              // Strict "detect maps" create is only for supported families. An
+              // Unknown or beta/unsupported ECU (e.g. EDC17) is imported through
+              // the "import & scan for potential maps" button in its panel above.
+              disabled={!selectedFile || !projectName.trim() || isUploading || isAnalyzing || !SUPPORTED_ECUS.has(ecuIdentification?.ecu_type || "")}
               className="w-full bg-gradient-to-r from-red-600/90 via-red-500/90 to-orange-500/90 hover:from-red-500/90 hover:via-red-400/90 hover:to-orange-400/90 text-white shadow-lg shadow-red-500/20"
               size="lg"
             >

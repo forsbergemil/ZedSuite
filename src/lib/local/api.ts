@@ -151,6 +151,7 @@ export async function handleLocalApi(
         mappack_exported: false,
         map_display_settings: fileRecord.map_display_settings || null,
         map_sort_mode: fileRecord.map_sort_mode || null,
+        hexdump_settings: fileRecord.hexdump_settings || null,
       });
     }
 

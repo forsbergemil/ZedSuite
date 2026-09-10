@@ -4,6 +4,8 @@ use crate::models::DetectedMap;
 pub mod ecu_identifier;
 pub mod smart_detector;
 pub mod ecu;
+// Family-agnostic heuristic scanner for unrecognized files (candidate tables).
+pub mod generic;
 
 // Public exports
 pub use ecu_identifier::{ECUIdentifier, ECUType};

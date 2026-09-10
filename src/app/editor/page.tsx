@@ -28,6 +28,8 @@ import {
   FileJson,
   Gauge,
   ArrowLeftRight,
+  Plus,
+  Star,
 } from "lucide-react";
 import { PiHeadCircuit } from "react-icons/pi";
 import { HexdumpViewer, type MapRegion } from "@/components/hexdump-viewer";
@@ -60,6 +62,8 @@ import FloatingLines from "@/components/FloatingLines";
 import ZedGradientDefs, { ZedFileIcon } from "@/components/zed-gradient-defs";
 import { ChecksumModal } from "@/components/checksum-modal";
 import { MappackExportModal } from "@/components/mappack-export-modal";
+import { CreateMapModal, type CreatedMap, type CreateMapPrefill } from "@/components/create-map-modal";
+import { CAR_BRANDS } from "@/lib/car-brands";
 import { MODAL_GLASS, MODAL_GLASS_LIGHT, TOAST_GLASS, TOAST_GLASS_LIGHT } from "@/lib/modal-glass";
 import { StyledSelect } from "@/components/styled-select";
 import { formatEcuWithManufacturer } from "@/lib/ecu-manufacturer";
@@ -72,6 +76,7 @@ import { disableDTC, enableDTC, detectDTCs, type DetectedDTC, type CodeblockInfo
 import { saveBytesToFile } from "@/lib/local/save-file";
 import { identifyEcu, bytesToBase64, detectorVersion, detectMaps } from "@/lib/local/detector";
 import * as localStore from "@/lib/local/store";
+import type { CustomSolution } from "@/lib/local/store";
 import { ThemeProvider, useTheme } from "@/contexts/theme-context";
 import { useSettings } from "@/contexts/settings-context";
 import { getCustomWallpaper, subscribeCustomWallpaper } from "@/lib/custom-wallpaper";
@@ -155,6 +160,19 @@ interface ProjectData {
     detector_version?: number;
     /** Rapport de complétude EDC16 : familles de maps attendues vs trouvées. */
     expected_maps?: { label: string; expected: number; found: number }[];
+    /**
+     * Cartes CANDIDATES du scanner heuristique générique (fichiers non
+     * reconnus, import « anyway »). Ce ne sont PAS des maps de confiance :
+     * elles ne sont affichées que comme régions surlignées dans le hexdump,
+     * jamais dans la liste des maps ni le mappack.
+     */
+    potential_maps?: MapData[];
+    /**
+     * Cartes que l'utilisateur a retenues parmi les candidates (« My Maps ») :
+     * promues depuis « Potential maps » et conservées avec le projet. Servent
+     * de collection de travail sur un fichier non reconnu.
+     */
+    my_maps?: MapData[];
   };
   fileId?: string;
   versions?: VersionDto[];
@@ -321,6 +339,16 @@ interface MapPropertiesModalProps {
   isClosing?: boolean;
   theme?: 'default' | 'light' | 'oled';
   workspaceRef?: React.RefObject<HTMLDivElement>;
+  /** User-created map (My Maps): the structural fields become editable. */
+  isUserMap?: boolean;
+  /** Save the map DEFINITION change (address, data type, endianness, dims). */
+  onSaveDefinition?: (def: {
+    address: number;
+    data_type: string;
+    is_little_endian: boolean;
+    size: number;
+    dimensions: { TwoDimensional: { rows: number; cols: number } } | { OneDimensional: { length: number } };
+  }) => void;
 }
 
 function MapPropertiesModal({
@@ -331,6 +359,8 @@ function MapPropertiesModal({
   isClosing = false,
   theme = 'default',
   workspaceRef,
+  isUserMap = false,
+  onSaveDefinition,
 }: MapPropertiesModalProps) {
   const [activeTab, setActiveTab] = useState<'map' | 'xAxis' | 'yAxis'>('map');
   const [localSettings, setLocalSettings] = useState<MapDisplaySettings>(settings);
@@ -341,12 +371,54 @@ function MapPropertiesModal({
   const modalRef = useRef<HTMLDivElement>(null);
 
   const handleSave = () => {
+    // For a user-created map, translate the structural fields back into the map
+    // definition so the map actually re-decodes (word size → data type, data
+    // org → endianness, W×H → dimensions, start address → address).
+    if (isUserMap && onSaveDefinition) {
+      const bpv = localSettings.wordSize === '8b' ? 1 : 2;
+      const data_type = bpv === 1
+        ? (localSettings.signed ? 'Int8' : 'UInt8')
+        : (localSettings.signed ? 'Int16' : 'UInt16');
+      const w = Math.max(1, Math.floor(Number(localSettings.width) || 1));
+      const h = Math.max(1, Math.floor(Number(localSettings.height) || 1));
+      const parsedAddr = parseInt(String(localSettings.startAddress).replace(/^\$/, ''), 16);
+      const address = Number.isFinite(parsedAddr) ? parsedAddr : mapData.address;
+      onSaveDefinition({
+        address,
+        data_type,
+        is_little_endian: localSettings.dataOrganization === 'LoHi',
+        size: w * h * bpv,
+        dimensions: h > 1 ? { TwoDimensional: { rows: h, cols: w } } : { OneDimensional: { length: w } },
+      });
+    }
     onSave(localSettings);
     onClose();
   };
 
   const updateMapSetting = <K extends keyof MapDisplaySettings>(key: K, value: MapDisplaySettings[K]) => {
     setLocalSettings(prev => ({ ...prev, [key]: value }));
+  };
+
+  // Changing the word size must keep the SAME byte region so no data is lost:
+  // 16b→8b doubles the cell count (width grows), 8b→16b halves it. Cols are
+  // adjusted first, keeping the row count when the total divides evenly.
+  const changeWordSize = (newWordSize: '8b' | '16b') => {
+    setLocalSettings(prev => {
+      const oldBpv = prev.wordSize === '8b' ? 1 : 2;
+      const newBpv = newWordSize === '8b' ? 1 : 2;
+      if (oldBpv === newBpv) return { ...prev, wordSize: newWordSize };
+      const bytes = Math.max(1, (Number(prev.width) || 1) * (Number(prev.height) || 1) * oldBpv);
+      const totalCells = Math.max(1, Math.floor(bytes / newBpv));
+      let h = Math.max(1, Number(prev.height) || 1);
+      let w: number;
+      if (totalCells % h === 0) {
+        w = totalCells / h;
+      } else {
+        h = 1;
+        w = totalCells;
+      }
+      return { ...prev, wordSize: newWordSize, width: w, height: h };
+    });
   };
 
   const updateXAxisSetting = <K extends keyof MapDisplaySettings['xAxis']>(key: K, value: MapDisplaySettings['xAxis'][K]) => {
@@ -526,13 +598,17 @@ function MapPropertiesModal({
               <div className="grid grid-cols-3 gap-3">
                 <div>
                   <label className={labelClass}>Start address</label>
-                  <input type="text" value={'$' + localSettings.startAddress} readOnly disabled className={`${inputClass} opacity-60 cursor-not-allowed font-mono`} placeholder="$DDA7C" />
+                  {isUserMap ? (
+                    <input type="text" value={localSettings.startAddress} onChange={(e) => updateMapSetting('startAddress', e.target.value.replace(/^\$/, '').toUpperCase())} className={`${inputClass} font-mono`} placeholder="162" />
+                  ) : (
+                    <input type="text" value={'$' + localSettings.startAddress} readOnly disabled className={`${inputClass} opacity-60 cursor-not-allowed font-mono`} placeholder="$DDA7C" />
+                  )}
                 </div>
                 <div>
                   <label className={labelClass}>Width x Height</label>
                   <div className="flex gap-1">
-                    <input type="number" value={localSettings.width} readOnly disabled className={`${inputClass} opacity-60 cursor-not-allowed`} min={1} />
-                    <input type="number" value={localSettings.height} readOnly disabled className={`${inputClass} opacity-60 cursor-not-allowed`} min={1} />
+                    <input type="number" value={localSettings.width} readOnly={!isUserMap} disabled={!isUserMap} onChange={isUserMap ? (e) => updateMapSetting('width', Math.max(1, parseInt(e.target.value) || 1)) : undefined} className={`${inputClass} ${isUserMap ? '' : 'opacity-60 cursor-not-allowed'}`} min={1} />
+                    <input type="number" value={localSettings.height} readOnly={!isUserMap} disabled={!isUserMap} onChange={isUserMap ? (e) => updateMapSetting('height', Math.max(1, parseInt(e.target.value) || 1)) : undefined} className={`${inputClass} ${isUserMap ? '' : 'opacity-60 cursor-not-allowed'}`} min={1} />
                   </div>
                 </div>
                 <div>
@@ -541,19 +617,52 @@ function MapPropertiesModal({
                 </div>
               </div>
 
-              {/* Row 4: Word size, Data org, Number format, Precision */}
-              <div className="grid grid-cols-4 gap-3">
+              {/* Row 4: Word size, Data org, Sign, Format, Precision (the
+                  structural ones are editable for user-created maps) */}
+              <div className="grid grid-cols-5 gap-3">
                 <div>
                   <label className={labelClass}>Word size</label>
-                  <input type="text" value={localSettings.wordSize} readOnly disabled className={`${inputClass} opacity-60 cursor-not-allowed`} />
+                  {isUserMap ? (
+                    <select value={localSettings.wordSize} onChange={(e) => changeWordSize(e.target.value as '8b' | '16b')} className={inputClass}>
+                      <option value="8b">8b</option>
+                      <option value="16b">16b</option>
+                    </select>
+                  ) : (
+                    <input type="text" value={localSettings.wordSize} readOnly disabled className={`${inputClass} opacity-60 cursor-not-allowed`} />
+                  )}
                 </div>
                 <div>
                   <label className={labelClass}>Data org</label>
-                  <input type="text" value={localSettings.dataOrganization} readOnly disabled className={`${inputClass} opacity-60 cursor-not-allowed`} />
+                  {isUserMap ? (
+                    <select value={localSettings.dataOrganization} onChange={(e) => updateMapSetting('dataOrganization', e.target.value as 'HiLo' | 'LoHi')} className={inputClass}>
+                      <option value="HiLo">HiLo</option>
+                      <option value="LoHi">LoHi</option>
+                    </select>
+                  ) : (
+                    <input type="text" value={localSettings.dataOrganization} readOnly disabled className={`${inputClass} opacity-60 cursor-not-allowed`} />
+                  )}
+                </div>
+                <div>
+                  <label className={labelClass}>Sign</label>
+                  {isUserMap ? (
+                    <select value={localSettings.signed ? 'signed' : 'unsigned'} onChange={(e) => updateMapSetting('signed', e.target.value === 'signed')} className={inputClass}>
+                      <option value="unsigned">Unsigned</option>
+                      <option value="signed">Signed</option>
+                    </select>
+                  ) : (
+                    <input type="text" value={localSettings.signed ? 'Signed' : 'Unsigned'} readOnly disabled className={`${inputClass} opacity-60 cursor-not-allowed`} />
+                  )}
                 </div>
                 <div>
                   <label className={labelClass}>Format</label>
-                  <input type="text" value={localSettings.numberFormat} readOnly disabled className={`${inputClass} opacity-60 cursor-not-allowed`} />
+                  {isUserMap ? (
+                    <select value={localSettings.numberFormat} onChange={(e) => updateMapSetting('numberFormat', e.target.value as 'Decimal' | 'Hexadecimal')} className={inputClass}>
+                      <option value="Decimal">Decimal</option>
+                      <option value="Hexadecimal">Hexadecimal</option>
+                    </select>
+                  ) : (
+                    <input type="text" value={localSettings.numberFormat} readOnly disabled className={`${inputClass} opacity-60 cursor-not-allowed`} />
+                  )}
                 </div>
                 <div>
                   <label className={labelClass}>Precision</label>
@@ -811,7 +920,7 @@ function ProjectInfoEditModal({
     });
   };
 
-  const brands = ["Audi", "Seat", "Skoda", "Volkswagen"];
+  const brands = CAR_BRANDS;
   const stages = ["Stage 1", "Stage 2", "Stage 3"];
   const transmissions = ["Automatic", "Manual"];
   const years = Array.from({ length: new Date().getFullYear() - 1996 }, (_, i) => new Date().getFullYear() - i);
@@ -1704,6 +1813,70 @@ function stripSoiTag<T extends { maps?: { name?: string }[] } | null | undefined
   return { ...detectionResults, maps };
 }
 
+/** Naive byte-sequence search: first index of `needle` in `hay` at/after `from`, or -1. */
+function indexOfBytes(hay: ArrayLike<number>, needle: number[], from: number): number {
+  if (needle.length === 0) return -1;
+  const last = hay.length - needle.length;
+  for (let i = Math.max(0, from); i <= last; i++) {
+    let ok = true;
+    for (let j = 0; j < needle.length; j++) {
+      if ((hay[i + j] & 0xff) !== (needle[j] & 0xff)) { ok = false; break; }
+    }
+    if (ok) return i;
+  }
+  return -1;
+}
+
+/**
+ * Find the offset (delta) at which a custom solution applies to `target`.
+ * A solution's patches carry source addresses and the original bytes they
+ * replaced. We try delta 0 (same layout), then every occurrence of the
+ * signature in the target, verifying that ALL patches' original bytes match at
+ * that delta before accepting it. Returns the delta, or null if no matching
+ * region is found. Legacy solutions (no original bytes) fall back to absolute
+ * placement when they fit.
+ */
+function locateCustomSolution(target: ArrayLike<number>, sol: CustomSolution): number | null {
+  const patches = sol.patches;
+  const hasOriginal = patches.length > 0 && patches.every(
+    (p) => Array.isArray(p.original) && p.original.length === p.data.length
+  );
+
+  if (!hasOriginal) {
+    const fits = patches.every((p) => p.address + p.data.length <= target.length && p.address >= 0);
+    return fits ? 0 : null;
+  }
+
+  const verify = (delta: number): boolean =>
+    patches.every((p) => {
+      const orig = p.original as number[];
+      for (let i = 0; i < orig.length; i++) {
+        const a = p.address + delta + i;
+        if (a < 0 || a >= target.length) return false;
+        if ((target[a] & 0xff) !== (orig[i] & 0xff)) return false;
+      }
+      return true;
+    });
+
+  // 1) Same layout / base.
+  if (verify(0)) return 0;
+
+  // 2) Global offset from the signature (partial dump → full dump, etc.).
+  const sig = sol.signature;
+  if (sig && sig.bytes.length > 0) {
+    let from = 0;
+    let guard = 0;
+    while (guard++ < 256) {
+      const idx = indexOfBytes(target, sig.bytes, from);
+      if (idx === -1) break;
+      const delta = idx - sig.address;
+      if (verify(delta)) return delta;
+      from = idx + 1;
+    }
+  }
+  return null;
+}
+
 function EditorPageContent() {
   const router = useRouter();
   // Project name comes from the query string (/editor?project=...) — static
@@ -2132,9 +2305,14 @@ function EditorPageContent() {
   const [hexdumpByteOrder, setHexdumpByteOrder] = useState<"hilo" | "lohi">("lohi");
   useEffect(() => {
     if (projectData?.ecu_type) {
-      setHexdumpByteOrder(isBigEndianEcu(projectData.ecu_type) ? "hilo" : "lohi");
+      // Unrecognized files scanned for potential maps: the generic scanner
+      // reads big-endian, so default the hexdump to hilo — otherwise the
+      // candidate values read byte-swapped until the user toggles it.
+      const hasPotential = (projectData.detectionResults?.potential_maps?.length ?? 0) > 0;
+      const bigEndian = isBigEndianEcu(projectData.ecu_type) || hasPotential;
+      setHexdumpByteOrder(bigEndian ? "hilo" : "lohi");
     }
-  }, [projectData?.ecu_type]);
+  }, [projectData?.ecu_type, projectData?.detectionResults?.potential_maps]);
   const [hexdumpFormat, setHexdumpFormat] = useState<"hex" | "dec">("hex");
 
   // Largeur de fenêtre hexdump calée sur son contenu réel (adresse + valeurs +
@@ -2145,13 +2323,17 @@ function EditorPageContent() {
   // Minimap réduite à 24px (-25 %) : largeurs fenêtre ajustées de -8px
   const HEXDUMP_WINDOW_WIDTH: Record<"8b" | "16b", number> = { "8b": 444, "16b": 568 };
 
-  // Recale la largeur à chaque bascule 8b/16b (la hauteur choisie est gardée)
-  useEffect(() => {
-    setHexdumpLayout(prev =>
-      prev.width === HEXDUMP_WINDOW_WIDTH[hexdumpSize]
-        ? prev
-        : { ...prev, width: HEXDUMP_WINDOW_WIDTH[hexdumpSize] }
-    );
+  // Grow the hexdump window to fit the value grid when its columns (or word
+  // size) change — never auto-shrink, so a manual size is kept — and never wider
+  // than the workspace (content scrolls horizontally beyond that). The user can
+  // still freely resize the window between changes.
+  const handleHexContentWidth = useCallback((px: number) => {
+    setHexdumpLayout((prev) => {
+      const ws = workspaceRef.current?.getBoundingClientRect();
+      const avail = ws ? Math.max(HEXDUMP_WINDOW_WIDTH[hexdumpSize], ws.width - prev.x - 8) : px;
+      const target = Math.max(HEXDUMP_WINDOW_WIDTH[hexdumpSize], Math.min(px, avail));
+      return prev.width >= target ? prev : { ...prev, width: target };
+    });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hexdumpSize]);
   const [easyViewMode, setEasyViewMode] = useState(settings.easyViewDefault);
@@ -2232,6 +2414,328 @@ function EditorPageContent() {
   const [isHexdumpActive, setIsHexdumpActive] = useState(true); // Par défaut hexdump est visible
   const [hexdumpScrollToAddress, setHexdumpScrollToAddress] = useState<number | null>(null); // Pour scroll manuel vers une map
   const [hexdumpScrollKey, setHexdumpScrollKey] = useState(0); // Key to force scroll even if same address
+  // Hexdump cell display mode (Mod/Ori/%) and changed-byte navigation — the
+  // controls live in the top toolbar; the hexdump reports its change list here.
+  const [hexDisplayMode, setHexDisplayMode] = useState<"modified" | "original" | "percent">("modified");
+  const [hexChangeAddrs, setHexChangeAddrs] = useState<number[]>([]);
+  const [hexChangeIndex, setHexChangeIndex] = useState(0);
+  // Address of the difference the ◀/▶ buttons last jumped to — highlighted with
+  // a yellow outline in the hexdump. null until the user navigates.
+  const [hexCurrentChangeAddr, setHexCurrentChangeAddr] = useState<number | null>(null);
+  // Hexdump content zoom — scales the whole viewer visually for small/high-DPI
+  // screens, independent of the editor's webview zoom.
+  //   • Ctrl + mouse wheel over the hexdump
+  //   • Ctrl + '+' / '-' / '0' while the hexdump is hovered or focused (also the
+  //     path some mice, e.g. Logitech Options+, use for "Ctrl+scroll" gestures)
+  // The listeners are on `document` in the CAPTURE phase so they attach reliably
+  // and can preventDefault before the webview runs its own zoom.
+  const [hexZoom, setHexZoom] = useState(1);
+  const hexZoomAreaRef = useRef<HTMLDivElement>(null);
+  const hexHoverRef = useRef(false);
+  // Per-project hexdump view settings. `hexColumns` is pushed into the viewer
+  // (and updated back via onColumnsChange). All of these are persisted to the
+  // project so reopening restores Dec/8b/columns/etc. without re-setting them.
+  const [hexColumns, setHexColumns] = useState(8);
+  const [hexStep, setHexStep] = useState("1"); // step for +/- on selected hexdump values
+  // How +/- applies the step: an absolute "value" (in the current base) or a
+  // "percent" of each value. Auto-switches to percent in % view.
+  const [hexStepMode, setHexStepMode] = useState<"value" | "percent">("value");
+  useEffect(() => { if (hexDisplayMode === "percent") setHexStepMode("percent"); }, [hexDisplayMode]);
+  // Re-render a VALUE step in the new base when Hex/Dec toggles, preserving its
+  // value (so "1A" hex becomes "26" dec, not a misread). Percent steps stay decimal.
+  const prevHexFormatRef = useRef(hexdumpFormat);
+  useEffect(() => {
+    if (prevHexFormatRef.current === hexdumpFormat) return;
+    const prev = prevHexFormatRef.current;
+    prevHexFormatRef.current = hexdumpFormat;
+    if (hexStepMode !== "value") return;
+    const val = prev === "hex" ? parseInt(hexStep.trim(), 16) : parseInt(hexStep.trim(), 10);
+    if (Number.isFinite(val)) setHexStep(hexdumpFormat === "hex" ? val.toString(16).toUpperCase() : String(val));
+  }, [hexdumpFormat, hexStep, hexStepMode]);
+  const hexSaveFileRef = useRef<string | null>(null);
+  useEffect(() => {
+    const fileId = projectData?.fileId;
+    if (!fileId) return;
+    // Skip the run right after a project (re)loads its settings, so we only
+    // persist genuine user changes and never write one project's view to another.
+    if (hexSaveFileRef.current !== fileId) {
+      hexSaveFileRef.current = fileId;
+      return;
+    }
+    const id = setTimeout(() => {
+      localStore
+        .updateFile(fileId, {
+          hexdump_settings: {
+            size: hexdumpSize,
+            format: hexdumpFormat,
+            byteOrder: hexdumpByteOrder,
+            displayMode: hexDisplayMode,
+            columns: hexColumns,
+            zoom: hexZoom,
+          },
+        } as Partial<FileRecord>)
+        .catch(() => {});
+    }, 600);
+    return () => clearTimeout(id);
+  }, [hexdumpSize, hexdumpFormat, hexdumpByteOrder, hexDisplayMode, hexColumns, hexZoom, projectData?.fileId]);
+  useEffect(() => {
+    const clampZoom = (z: number) => Math.min(3, Math.max(0.5, Math.round(z * 100) / 100));
+    const overHex = (t: EventTarget | null) => {
+      const area = hexZoomAreaRef.current;
+      return !!area && t instanceof Node && area.contains(t);
+    };
+    const onWheel = (e: WheelEvent) => {
+      if (!e.ctrlKey || !overHex(e.target)) return; // plain scroll still scrolls
+      e.preventDefault();
+      e.stopPropagation();
+      setHexZoom((z) => clampZoom(z * (e.deltaY < 0 ? 1.1 : 1 / 1.1)));
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
+      if (!(hexHoverRef.current || overHex(document.activeElement))) return;
+      if (e.key === "+" || e.key === "=") { e.preventDefault(); setHexZoom((z) => clampZoom(z * 1.1)); }
+      else if (e.key === "-" || e.key === "_") { e.preventDefault(); setHexZoom((z) => clampZoom(z / 1.1)); }
+      else if (e.key === "0") { e.preventDefault(); setHexZoom(1); }
+    };
+    document.addEventListener("wheel", onWheel, { passive: false, capture: true });
+    document.addEventListener("keydown", onKey, true);
+    return () => {
+      document.removeEventListener("wheel", onWheel, { capture: true } as EventListenerOptions);
+      document.removeEventListener("keydown", onKey, true);
+    };
+  }, []);
+  // Refs mirror the change-nav state so stepHexChange reads the latest values
+  // synchronously (no nested setState) and can seed from a hexdump selection.
+  const hexChangeAddrsRef = useRef<number[]>([]);
+  const hexChangeIndexRef = useRef(0);
+  const hexSelStartRef = useRef<number | null>(null); // selected byte in the hexdump
+  const hexSelSeededRef = useRef<number | null>(null); // selection already jumped to
+  const handleHexDiffAddresses = useCallback((addrs: number[]) => {
+    hexChangeAddrsRef.current = addrs;
+    setHexChangeAddrs(addrs);
+    setHexChangeIndex((i) => {
+      const ni = addrs.length === 0 ? 0 : Math.min(i, addrs.length - 1);
+      hexChangeIndexRef.current = ni;
+      return ni;
+    });
+    // Drop the yellow highlight if the change it pointed at is gone (e.g. the
+    // byte was edited back to stock), keep it otherwise.
+    setHexCurrentChangeAddr((cur) => (cur != null && addrs.includes(cur) ? cur : null));
+  }, []);
+  // The hexdump reports its current selection start here; the diff buttons then
+  // count from it (see stepHexChange).
+  const handleHexSelectionStart = useCallback((addr: number | null) => {
+    hexSelStartRef.current = addr;
+  }, []);
+  // Stable so the hexdump's scroll-to effect doesn't re-run every render.
+  const handleHexScrollComplete = useCallback(() => setHexdumpScrollToAddress(null), []);
+  // Direct byte editing from the hexdump: write the value's byte(s) into
+  // file_data (so it displays) and record them in binaryModifications (so they
+  // save and reconstruct) — the same path solutions use.
+  const handleHexValueEdit = useCallback((byteOffset: number, newValue: number) => {
+    if (!projectData?.file_data) return;
+    const bpv = hexdumpSize === "16b" ? 2 : 1;
+    const parts: { addr: number; val: number }[] = [];
+    if (bpv === 1) {
+      parts.push({ addr: byteOffset, val: newValue & 0xff });
+    } else {
+      const hi = (newValue >> 8) & 0xff;
+      const lo = newValue & 0xff;
+      if (hexdumpByteOrder === "hilo") {
+        parts.push({ addr: byteOffset, val: hi }, { addr: byteOffset + 1, val: lo });
+      } else {
+        parts.push({ addr: byteOffset, val: lo }, { addr: byteOffset + 1, val: hi });
+      }
+    }
+    const original = originalFileDataRef.current;
+    const file = [...projectData.file_data];
+    setBinaryModifications((prev) => {
+      const next = new Map(prev);
+      for (const p of parts) {
+        if (p.addr < 0 || p.addr >= file.length) continue;
+        const stock = original && p.addr < original.length ? original[p.addr] : file[p.addr];
+        if (p.val === stock) next.delete(p.addr);
+        else next.set(p.addr, { oldValue: stock, newValue: p.val });
+      }
+      return next;
+    });
+    for (const p of parts) if (p.addr >= 0 && p.addr < file.length) file[p.addr] = p.val;
+    setProjectData((prev) => (prev ? { ...prev, file_data: file } : prev));
+    setHasUnsavedChanges(true);
+  }, [projectData, hexdumpSize, hexdumpByteOrder]);
+
+  // Split a value into its byte writes at `off`, honouring width and byte order.
+  const valueToByteWrites = useCallback((off: number, value: number): { addr: number; val: number }[] => {
+    const bpv = hexdumpSize === "16b" ? 2 : 1;
+    if (bpv === 1) return [{ addr: off, val: value & 0xff }];
+    const hi = (value >> 8) & 0xff;
+    const lo = value & 0xff;
+    return hexdumpByteOrder === "hilo"
+      ? [{ addr: off, val: hi }, { addr: off + 1, val: lo }]
+      : [{ addr: off, val: lo }, { addr: off + 1, val: hi }];
+  }, [hexdumpSize, hexdumpByteOrder]);
+
+  // Apply the byte writes to file_data + binaryModifications in one state update
+  // (dropping entries that return to stock). Shared by fill/paste. Undoable.
+  const applyByteWrites = useCallback((parts: { addr: number; val: number }[]) => {
+    if (!projectData?.file_data || parts.length === 0) return;
+    const original = originalFileDataRef.current;
+    const file = [...projectData.file_data];
+    setBinaryModifications((prev) => {
+      const next = new Map(prev);
+      for (const p of parts) {
+        if (p.addr < 0 || p.addr >= file.length) continue;
+        const stock = original && p.addr < original.length ? original[p.addr] : file[p.addr];
+        if (p.val === stock) next.delete(p.addr);
+        else next.set(p.addr, { oldValue: stock, newValue: p.val });
+      }
+      return next;
+    });
+    for (const p of parts) if (p.addr >= 0 && p.addr < file.length) file[p.addr] = p.val;
+    setProjectData((prev) => (prev ? { ...prev, file_data: file } : prev));
+    setHasUnsavedChanges(true);
+  }, [projectData]);
+
+  // Bulk edit / fill: write one value to EVERY selected value.
+  const handleHexValuesFill = useCallback((addrs: number[], newValue: number) => {
+    if (!projectData?.file_data) return;
+    const len = projectData.file_data.length;
+    const bpv = hexdumpSize === "16b" ? 2 : 1;
+    const parts: { addr: number; val: number }[] = [];
+    for (const off of addrs) if (off >= 0 && off + bpv <= len) parts.push(...valueToByteWrites(off, newValue));
+    applyByteWrites(parts);
+  }, [projectData, hexdumpSize, valueToByteWrites, applyByteWrites]);
+
+  // + / - on selected values: add or subtract the toolbar step from each,
+  // clamped to the value range. Reads the current value from file_data.
+  const handleHexValuesAdjust = useCallback((addrs: number[], sign: 1 | -1) => {
+    if (!projectData?.file_data) return;
+    const isPct = hexStepMode === "percent";
+    // Percent steps are always decimal; value steps follow the display base.
+    const parsed = isPct
+      ? parseFloat(hexStep.trim())
+      : (hexdumpFormat === "hex" ? parseInt(hexStep.trim(), 16) : parseInt(hexStep.trim(), 10));
+    const step = Math.abs(parsed);
+    if (!Number.isFinite(step) || step === 0) return;
+    const file = projectData.file_data;
+    const len = file.length;
+    const bpv = hexdumpSize === "16b" ? 2 : 1;
+    const max = bpv === 1 ? 0xff : 0xffff;
+    const parts: { addr: number; val: number }[] = [];
+    for (const off of addrs) {
+      if (off < 0 || off + bpv > len) continue;
+      const cur = bpv === 1
+        ? file[off]
+        : (hexdumpByteOrder === "hilo" ? ((file[off] << 8) | file[off + 1]) : (file[off] | (file[off + 1] << 8)));
+      // Percent: scale each value by its own ±step%. Value: add/subtract the step.
+      // Round away from the current value by ≥1 so a small % on a small value
+      // still moves it.
+      let nv: number;
+      if (isPct) {
+        if (cur === 0) {
+          nv = 0; // a percentage of zero is still zero
+        } else {
+          const raw = cur * (1 + (sign * step) / 100);
+          nv = sign > 0 ? Math.max(cur + 1, Math.round(raw)) : Math.min(cur - 1, Math.round(raw));
+        }
+      } else {
+        nv = cur + sign * step;
+      }
+      nv = Math.max(0, Math.min(max, nv));
+      if (nv !== cur) parts.push(...valueToByteWrites(off, nv));
+    }
+    applyByteWrites(parts);
+  }, [projectData, hexdumpSize, hexdumpByteOrder, hexStep, hexStepMode, hexdumpFormat, valueToByteWrites, applyByteWrites]);
+
+  // Paste (Ctrl+V): write consecutive values from startByte.
+  const handleHexValuesPaste = useCallback((startByte: number, values: number[]) => {
+    if (!projectData?.file_data) return;
+    const len = projectData.file_data.length;
+    const bpv = hexdumpSize === "16b" ? 2 : 1;
+    const parts: { addr: number; val: number }[] = [];
+    for (let i = 0; i < values.length; i++) {
+      const off = startByte + i * bpv;
+      if (off >= 0 && off + bpv <= len) parts.push(...valueToByteWrites(off, values[i]));
+    }
+    applyByteWrites(parts);
+  }, [projectData, hexdumpSize, valueToByteWrites, applyByteWrites]);
+
+  // Restore selection to stock (F11): set every selected value's bytes back to
+  // the original file and drop those binaryModifications. One update; undoable.
+  const handleHexValuesRestore = useCallback((addrs: number[]) => {
+    if (!projectData?.file_data) return;
+    const original = originalFileDataRef.current;
+    if (!original) return;
+    const bpv = hexdumpSize === "16b" ? 2 : 1;
+    const file = [...projectData.file_data];
+    const byteAddrs: number[] = [];
+    for (const off of addrs) for (let b = 0; b < bpv; b++) byteAddrs.push(off + b);
+    let changed = false;
+    for (const addr of byteAddrs) {
+      if (addr < 0 || addr >= file.length || addr >= original.length) continue;
+      if (file[addr] !== original[addr]) { file[addr] = original[addr]; changed = true; }
+    }
+    if (!changed) return;
+    setBinaryModifications((prev) => {
+      const next = new Map(prev);
+      for (const addr of byteAddrs) next.delete(addr);
+      return next;
+    });
+    setProjectData((prev) => (prev ? { ...prev, file_data: file } : prev));
+    setHasUnsavedChanges(true);
+  }, [projectData, hexdumpSize]);
+
+  const stepHexChange = useCallback((dir: 1 | -1) => {
+    const addrs = hexChangeAddrsRef.current;
+    if (addrs.length === 0) return;
+    const sel = hexSelStartRef.current;
+    let next: number;
+    if (sel != null && hexSelSeededRef.current !== sel) {
+      // A byte is freshly selected in the hexdump: start counting differences
+      // from it — the first press lands on the nearest change in that direction.
+      if (dir > 0) {
+        const i = addrs.findIndex((a) => a >= sel);
+        next = i === -1 ? 0 : i; // wrap to the first change if none follow
+      } else {
+        let i = -1;
+        for (let k = 0; k < addrs.length; k++) {
+          if (addrs[k] <= sel) i = k; else break;
+        }
+        next = i === -1 ? addrs.length - 1 : i; // wrap to the last change
+      }
+      hexSelSeededRef.current = sel; // consumed — later presses step normally
+    } else {
+      const prev = hexChangeIndexRef.current;
+      next = dir > 0
+        ? (prev < addrs.length - 1 ? prev + 1 : 0)
+        : (prev > 0 ? prev - 1 : addrs.length - 1);
+    }
+    hexChangeIndexRef.current = next;
+    setHexChangeIndex(next);
+    setHexCurrentChangeAddr(addrs[next]);
+    setHexdumpScrollToAddress(addrs[next]);
+    setHexdumpScrollKey((k) => k + 1);
+  }, []);
+
+  // N = next difference, V = previous difference — while the pointer is over the
+  // hexdump (or focus is in it) and not typing in a field.
+  useEffect(() => {
+    const overHex = (t: EventTarget | null) => {
+      const a = hexZoomAreaRef.current;
+      return !!a && t instanceof Node && a.contains(t);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return;
+      if (!(hexHoverRef.current || overHex(document.activeElement))) return;
+      const ae = document.activeElement as HTMLElement | null;
+      if (ae && (ae.tagName === "INPUT" || ae.tagName === "TEXTAREA" || ae.isContentEditable)) return;
+      const k = e.key.toLowerCase();
+      if (k === "n") { e.preventDefault(); stepHexChange(1); }
+      else if (k === "v") { e.preventDefault(); stepHexChange(-1); }
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [stepHexChange]);
   const [globalCursorInfo, setGlobalCursorInfo] = useState<{
     mapName: string;
     mapAddress: number;
@@ -2262,6 +2766,12 @@ function EditorPageContent() {
   // Solutions appliquées dans ce projet : { id: nom de version }
   const [usedSolutions, setUsedSolutions] = useState<Record<string, string>>({});
   const [solutionNotification, setSolutionNotification] = useState<{ count: number; visible: boolean; fading: boolean }>({ count: 0, visible: false, fading: false });
+  // Custom solutions (user-made, global) — the byte diff of a version saved as
+  // a reusable patch. Loaded once from the app-data store.
+  const [customSolutions, setCustomSolutions] = useState<CustomSolution[]>([]);
+  useEffect(() => {
+    localStore.listCustomSolutions().then(setCustomSolutions).catch(() => {});
+  }, []);
 
   // Mappack lock state
   const [mappackUnlocked, setMappackUnlocked] = useState(false);
@@ -2305,6 +2815,104 @@ function EditorPageContent() {
 
   // Compare modal state
   const [isCompareOpen, setIsCompareOpen] = useState(false);
+  // Other projects (with their versions), offered in the compare selectors so
+  // two files — or two specific versions — from DIFFERENT projects can be
+  // compared. Loaded when the modal opens.
+  const [compareExternalProjects, setCompareExternalProjects] = useState<
+    { fileId: string; name: string; ecuType?: string; versions: { id: string; name: string }[] }[]
+  >([]);
+  useEffect(() => {
+    if (!isCompareOpen) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        // Re-read from disk every time the modal opens, so projects created
+        // since the editor loaded appear in the selectors.
+        const files = await localStore.listFiles();
+        let others = files.filter((f) => f.id !== projectData?.fileId);
+        // Narrow to the SAME vehicle brand as the open project, so the dropdown
+        // isn't flooded with every file on disk. Safety net: if no other project
+        // shares the brand, fall back to showing them all rather than an empty
+        // list. Skipped when the open project has no brand set.
+        const currentBrand = (projectData?.vehicle_brand || "").trim().toLowerCase();
+        if (currentBrand) {
+          const sameBrand = others.filter(
+            (f) => (f.vehicle_brand || "").trim().toLowerCase() === currentBrand
+          );
+          if (sameBrand.length > 0) others = sameBrand;
+        }
+        const withVersions = await Promise.all(
+          others.map(async (f) => ({
+            fileId: f.id,
+            name: f.project_name || f.file_name || f.id,
+            ecuType: f.ecu_type,
+            versions: (await localStore.listVersions(f.id)).map((v) => ({ id: v.id, name: v.name })),
+          }))
+        );
+        if (!cancelled) setCompareExternalProjects(withVersions);
+      } catch {
+        if (!cancelled) setCompareExternalProjects([]);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [isCompareOpen, projectData?.fileId, projectData?.vehicle_brand]);
+
+  // Reconstruct any version of another project (original + its edits), using
+  // THAT project's own maps and endianness. Mirrors buildVersionFileData but
+  // for a file the editor doesn't have loaded.
+  const resolveExternalVersionData = useCallback(async (fileId: string, versionId: string): Promise<number[]> => {
+    const original = await localStore.readBinary(fileId);
+    if (!original) return [];
+    const originalArr = Array.from(original);
+    const vers = await localStore.listVersions(fileId);
+    const version = vers.find((v) => v.id === versionId);
+    if (!version || version.name === "Ori") return originalArr;
+
+    let base = originalArr;
+    try {
+      const vbin = await localStore.readVersionBinary(versionId);
+      if (vbin) base = Array.from(vbin);
+    } catch { /* no imported binary for this version */ }
+
+    const record = await localStore.getFile(fileId);
+    const bigEndian = isBigEndianEcu(record?.ecu_type);
+    let detection: any = record?.detection_data ?? {};
+    if (typeof detection === "string") { try { detection = JSON.parse(detection); } catch { detection = {}; } }
+    const maps: any[] = Array.isArray(detection?.maps) ? detection.maps : [];
+
+    const data = new Uint8Array(base);
+    try {
+      const edits = await localStore.listMapEdits(versionId);
+      for (const edit of edits) {
+        const mapAddress = edit.map_address;
+        const payload: any = edit.payload || {};
+        if (mapAddress === -1 && Array.isArray(payload.changes)) {
+          for (const c of payload.changes) {
+            if (c.address >= 0 && c.address < data.length) data[c.address] = c.newValue & 0xff;
+          }
+          continue;
+        }
+        if (mapAddress >= 0 && Array.isArray(payload.changedCells)) {
+          const region = maps.find((m) => m.address === mapAddress);
+          if (!region) continue;
+          const rows = region.dimensions?.TwoDimensional?.rows || 1;
+          const cols = region.dimensions?.TwoDimensional?.cols || 1;
+          const total = rows * cols;
+          const cellSize = total > 0 ? Math.max(1, Math.floor((region.size || 0) / total)) : 2;
+          for (const cell of payload.changedCells) {
+            const addr = mapAddress + (cell.row * cols + cell.col) * cellSize;
+            if (cellSize === 1) {
+              if (addr >= 0 && addr < data.length) data[addr] = cell.value & 0xff;
+            } else if (addr >= 0 && addr + 1 < data.length) {
+              if (bigEndian) { data[addr] = (cell.value >> 8) & 0xff; data[addr + 1] = cell.value & 0xff; }
+              else { data[addr] = cell.value & 0xff; data[addr + 1] = (cell.value >> 8) & 0xff; }
+            }
+          }
+        }
+      }
+    } catch { /* edits unreadable — return base */ }
+    return Array.from(data);
+  }, []);
 
   // Checksum modal state
   const [isChecksumModalOpen, setIsChecksumModalOpen] = useState(false);
@@ -2415,6 +3023,131 @@ function EditorPageContent() {
 
   // Track if user has made changes since loading the version (dirty flag)
   const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
+
+  // ── Undo / redo ──────────────────────────────────────────────────────────
+  // A single history of snapshots covers EVERY edit type, because all of them
+  // land in the same four pieces of state: the binary bytes (file_data), the
+  // direct byte edits (binaryModifications), the map-cell edits
+  // (allMapModifications) and the axis-label edits (mapAxisLabels). Each user
+  // edit pushes one snapshot; undo/redo restore a snapshot and a guard stops the
+  // restore from being recorded as a new edit. History resets when another
+  // version or project is loaded, so undo never crosses a load.
+  type EditSnapshot = {
+    data: Uint8Array;
+    binary: Map<number, { oldValue: number; newValue: number }>;
+    mapMods: Map<number, Record<string, number>>;
+    axis: Map<number, { x?: string[]; y?: string[] }>;
+  };
+  const historyRef = useRef<EditSnapshot[]>([]);
+  const historyIndexRef = useRef(-1);
+  const historyRestoringRef = useRef(false);
+  const historyCtxRef = useRef<string>("");
+  const historyCtxAtRef = useRef<number>(0);
+  // Share the (immutable-per-edit) file_data buffer between snapshots that don't
+  // change it (e.g. map-only edits), so only real byte changes cost a 2 MB copy.
+  const historyFdSrcRef = useRef<number[] | null>(null);
+  const historyFdSnapRef = useRef<Uint8Array | null>(null);
+  const [canUndo, setCanUndo] = useState(false);
+  const [canRedo, setCanRedo] = useState(false);
+  const HISTORY_MAX = 60;
+
+  const buildEditSnapshot = useCallback((): EditSnapshot | null => {
+    const fd = projectData?.file_data;
+    if (!fd) return null;
+    let data: Uint8Array;
+    if (historyFdSrcRef.current === fd && historyFdSnapRef.current) {
+      data = historyFdSnapRef.current; // file_data unchanged since last snapshot
+    } else {
+      data = Uint8Array.from(fd);
+      historyFdSrcRef.current = fd;
+      historyFdSnapRef.current = data;
+    }
+    return {
+      data,
+      binary: new Map(binaryModifications),
+      mapMods: new Map(allMapModifications),
+      axis: new Map(mapAxisLabels),
+    };
+  }, [projectData?.file_data, binaryModifications, allMapModifications, mapAxisLabels]);
+
+  // Record edits into the history (and reset it on a version/project change).
+  useEffect(() => {
+    const snap = buildEditSnapshot();
+    if (!snap) return;
+    const ctx = `${projectData?.fileId ?? ""}:${currentVersionId ?? ""}`;
+    if (historyRestoringRef.current) {
+      historyRestoringRef.current = false;
+      historyCtxRef.current = ctx;
+      return; // a restore, not a new edit
+    }
+    if (ctx !== historyCtxRef.current) {
+      // New version/project loaded → fresh baseline, no undo across the load.
+      historyCtxRef.current = ctx;
+      historyCtxAtRef.current = Date.now();
+      historyRef.current = [snap];
+      historyIndexRef.current = 0;
+      setCanUndo(false);
+      setCanRedo(false);
+      return;
+    }
+    // Settle window: a version load applies its saved edits over a few ticks
+    // (currentVersionId, then file_data + the maps). While still at the baseline
+    // and just after the load, fold those into the baseline instead of recording
+    // them, so a version's own edits never become undo steps.
+    if (historyIndexRef.current === 0 && Date.now() - historyCtxAtRef.current < 1500) {
+      historyRef.current = [snap];
+      return;
+    }
+    // Normal edit: drop any redo tail, append, cap the length.
+    const kept = historyRef.current.slice(0, historyIndexRef.current + 1);
+    kept.push(snap);
+    const trimmed = kept.length > HISTORY_MAX ? kept.slice(kept.length - HISTORY_MAX) : kept;
+    historyRef.current = trimmed;
+    historyIndexRef.current = trimmed.length - 1;
+    setCanUndo(historyIndexRef.current > 0);
+    setCanRedo(false);
+  }, [buildEditSnapshot, projectData?.fileId, currentVersionId]);
+
+  const restoreEditSnapshot = useCallback((snap: EditSnapshot) => {
+    historyRestoringRef.current = true;
+    setBinaryModifications(new Map(snap.binary));
+    setAllMapModifications(new Map(snap.mapMods));
+    setMapAxisLabels(new Map(snap.axis));
+    setProjectData((prev) => (prev ? { ...prev, file_data: Array.from(snap.data) } : prev));
+    setHasUnsavedChanges(true);
+  }, []);
+
+  const undoEdit = useCallback(() => {
+    if (historyIndexRef.current <= 0) return;
+    historyIndexRef.current -= 1;
+    restoreEditSnapshot(historyRef.current[historyIndexRef.current]);
+    setCanUndo(historyIndexRef.current > 0);
+    setCanRedo(historyIndexRef.current < historyRef.current.length - 1);
+  }, [restoreEditSnapshot]);
+
+  const redoEdit = useCallback(() => {
+    if (historyIndexRef.current >= historyRef.current.length - 1) return;
+    historyIndexRef.current += 1;
+    restoreEditSnapshot(historyRef.current[historyIndexRef.current]);
+    setCanUndo(historyIndexRef.current > 0);
+    setCanRedo(historyIndexRef.current < historyRef.current.length - 1);
+  }, [restoreEditSnapshot]);
+
+  // Ctrl/Cmd+Z to undo, Ctrl/Cmd+Y or Ctrl/Cmd+Shift+Z to redo. Skipped while a
+  // real input is focused so its own text undo keeps working.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      const ae = document.activeElement as HTMLElement | null;
+      if (ae && (ae.tagName === "INPUT" || ae.tagName === "TEXTAREA" || ae.isContentEditable)) return;
+      const k = e.key.toLowerCase();
+      if (k === "z" && !e.shiftKey) { e.preventDefault(); undoEdit(); }
+      else if (k === "y" || (k === "z" && e.shiftKey)) { e.preventDefault(); redoEdit(); }
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [undoEdit, redoEdit]);
+  // ─────────────────────────────────────────────────────────────────────────
 
   // État du checksum de la version courante — surveillé en continu sur les
   // octets courants (édits inclus), affiché sous le sélecteur de version
@@ -2753,12 +3486,18 @@ function EditorPageContent() {
           let identityVerified = false;
           try {
             const ident = await identifyEcu(bytesToBase64(uint8Array), file.name);
+            // Compare case-insensitively and treat "unknown" (either case, the
+            // value the import-anyway/scan path stores) as "no constraint" — a
+            // beta EDC17 project keeps its real type on both sides and matches,
+            // while a scanned "unknown" project accepts any same-size file.
+            const projEcu = (projectData?.ecu_type || "").trim().toLowerCase();
+            const fileEcu = (ident.ecu_type || "").trim().toLowerCase();
             if (
-              projectData?.ecu_type && projectData.ecu_type !== "Unknown" &&
-              ident.ecu_type && ident.ecu_type !== "Unknown" &&
-              ident.ecu_type !== projectData.ecu_type
+              projEcu && projEcu !== "unknown" &&
+              fileEcu && fileEcu !== "unknown" &&
+              fileEcu !== projEcu
             ) {
-              rejectImport(`${t.errors.importEcuMismatch} (${ident.ecu_type} ≠ ${projectData.ecu_type})`);
+              rejectImport(`${t.errors.importEcuMismatch} (${ident.ecu_type} ≠ ${projectData?.ecu_type})`);
               return;
             }
             if (projectData?.hardware_version && ident.hardware_version &&
@@ -2961,7 +3700,12 @@ function EditorPageContent() {
   ): void => {
     if (!projectData) return;
 
-    const maps = projectData.detectionResults?.maps || [];
+    // Include user-created maps (My Maps): their cell edits must write back to
+    // the binary too, so the lookup below has to find them like detected maps.
+    const maps = [
+      ...(projectData.detectionResults?.maps || []),
+      ...(projectData.detectionResults?.my_maps || []),
+    ];
     const ecuBigEndian = isBigEndianEcu(projectData.ecu_type);
 
     // Effective display corrections: per-project overrides saved in the map
@@ -3207,6 +3951,91 @@ function EditorPageContent() {
     }
     return Array.from(data);
   }, [versions, projectData, applyEditsToFileData]);
+
+  // ── Custom solutions from a version ────────────────────────────────
+  // Compute the byte diff of a version vs the original and save it as a
+  // reusable global solution. Contiguous differing bytes are grouped into one
+  // patch each.
+  const handleCreateSolutionFromVersion = useCallback(async (
+    versionId: string,
+    name: string,
+    description: string
+  ) => {
+    const original = originalFileDataRef.current ?? projectData?.file_data ?? [];
+    if (original.length === 0) {
+      toast({ title: t.common?.error || "Error", description: "No original file loaded.", variant: "destructive" });
+      return;
+    }
+    let versionBytes: number[];
+    try {
+      versionBytes = await buildVersionFileData(versionId);
+    } catch {
+      toast({ title: t.common?.error || "Error", description: "Could not read the version.", variant: "destructive" });
+      return;
+    }
+
+    // Group contiguous differing bytes into patches, keeping the original bytes
+    // each one replaced (needed to relocate/verify on a different file).
+    const patches: localStore.CustomSolutionPatch[] = [];
+    let runStart = -1;
+    let runData: number[] = [];
+    let runOrig: number[] = [];
+    const n = Math.min(original.length, versionBytes.length);
+    for (let i = 0; i <= n; i++) {
+      const differs = i < n && (original[i] & 0xff) !== (versionBytes[i] & 0xff);
+      if (differs) {
+        if (runStart === -1) { runStart = i; runData = []; runOrig = []; }
+        runData.push(versionBytes[i] & 0xff);
+        runOrig.push(original[i] & 0xff);
+      } else if (runStart !== -1) {
+        patches.push({ address: runStart, data: runData, original: runOrig });
+        runStart = -1;
+        runData = [];
+        runOrig = [];
+      }
+    }
+
+    const byteCount = patches.reduce((s, p) => s + p.data.length, 0);
+    if (byteCount === 0) {
+      toast({ title: t.common?.error || "Nothing to save", description: "This version has no changes vs the original.", variant: "destructive" });
+      return;
+    }
+
+    // Signature: source-original bytes around the first patch (16 bytes of
+    // context + up to 128 bytes of the region). Used to find the global offset
+    // when applying to a file of a different size/base.
+    const first = patches[0];
+    const sigStart = Math.max(0, first.address - 16);
+    const sigEnd = Math.min(original.length, first.address + first.data.length + 16, sigStart + 160);
+    const signature = { address: sigStart, bytes: original.slice(sigStart, sigEnd).map((b) => b & 0xff) };
+
+    const sol: CustomSolution = {
+      id: `custom-${(typeof crypto !== "undefined" && crypto.randomUUID) ? crypto.randomUUID() : Date.now()}`,
+      name: name.trim() || `Solution ${new Date().toLocaleDateString()}`,
+      description: description.trim() || undefined,
+      ecuType: projectData?.ecu_type,
+      createdAt: new Date().toISOString(),
+      patches,
+      byteCount,
+      signature,
+    };
+    try {
+      const list = await localStore.saveCustomSolution(sol);
+      setCustomSolutions(list);
+      toast({ title: t.sidebar?.solutions || "Solutions", description: `Saved "${sol.name}" (${byteCount} bytes).` });
+    } catch (e: any) {
+      toast({ title: t.common?.error || "Error", description: String(e?.message || e), variant: "destructive" });
+    }
+  }, [projectData, buildVersionFileData, toast, t]);
+
+  const handleDeleteCustomSolution = useCallback(async (id: string) => {
+    try {
+      const list = await localStore.deleteCustomSolution(id);
+      setCustomSolutions(list);
+    } catch {
+      // ignore
+    }
+  }, []);
 
   // Données affichées par l'hexdump : fichier courant + édits de maps EN
   // MÉMOIRE (pas encore sauvegardés). Sans ça, les cellules modifiées dans une
@@ -3774,8 +4603,10 @@ function EditorPageContent() {
     if (!el) return;
     const rect = el.getBoundingClientRect();
     const workspaceRect = workspaceRef.current?.getBoundingClientRect();
-    const width = Math.max(360, rect.width);
-    const height = Math.max(260, rect.height);
+    // Bound the resized size to the workspace so a free drag can't push the
+    // window off-screen.
+    const width = Math.max(360, workspaceRect ? Math.min(rect.width, workspaceRect.width) : rect.width);
+    const height = Math.max(260, workspaceRect ? Math.min(rect.height, workspaceRect.height) : rect.height);
     const x = rect.left - (workspaceRect?.left || 0);
     const y = rect.top - (workspaceRect?.top || 0);
     const clamped = clampPosition(x, y, width, height);
@@ -3860,6 +4691,18 @@ function EditorPageContent() {
             const storedSort = response.data.map_sort_mode;
             if (storedSort === "address" || storedSort === "name" || storedSort === "name-desc") {
               setMapSortMode(storedSort);
+            }
+
+            // Per-project hexdump view preferences (Hex/Dec, 8b/16b, byte order,
+            // display mode, columns, zoom) — restored so they persist per project.
+            const hexs = response.data.hexdump_settings;
+            if (hexs && typeof hexs === "object") {
+              if (hexs.size === "8b" || hexs.size === "16b") setHexdumpSize(hexs.size);
+              if (hexs.format === "hex" || hexs.format === "dec") setHexdumpFormat(hexs.format);
+              if (hexs.byteOrder === "hilo" || hexs.byteOrder === "lohi") setHexdumpByteOrder(hexs.byteOrder);
+              if (hexs.displayMode === "modified" || hexs.displayMode === "original" || hexs.displayMode === "percent") setHexDisplayMode(hexs.displayMode);
+              if (typeof hexs.columns === "number" && hexs.columns >= 1) setHexColumns(Math.min(512, Math.round(hexs.columns)));
+              if (typeof hexs.zoom === "number" && hexs.zoom > 0) setHexZoom(Math.min(3, Math.max(0.5, hexs.zoom)));
             }
 
             // Restore per-project map display customizations from the backend
@@ -5619,6 +6462,38 @@ await axios.put("/api/versioning/map-edits", { versionId: currentVersionId, edit
     }, 200);
   };
 
+  // Save a user-created map's DEFINITION change (address, data type, endianness,
+  // dimensions) into my_maps, persist it, and re-decode the open window.
+  const handleSaveMapDefinition = (oldAddress: number, def: {
+    address: number;
+    data_type: string;
+    is_little_endian: boolean;
+    size: number;
+    dimensions: { TwoDimensional: { rows: number; cols: number } } | { OneDimensional: { length: number } };
+  }) => {
+    if (!projectData) return;
+    const existing = projectData.detectionResults.my_maps || [];
+    const idx = existing.findIndex((m) => m.address === oldAddress);
+    if (idx < 0) return;
+    const updated = {
+      ...existing[idx],
+      address: def.address,
+      size: def.size,
+      dimensions: def.dimensions,
+      data_type: def.data_type,
+      is_little_endian: def.is_little_endian,
+    } as unknown as MapData;
+    const my_maps = existing.map((m, i) => (i === idx ? updated : m));
+    const detectionResults = { ...projectData.detectionResults, my_maps };
+    setProjectData({ ...projectData, detectionResults });
+    void persistDetectionResults(detectionResults);
+    clearMapDataCache();
+    // Re-decode the open window (its key is the address, so a changed address
+    // remounts the viewer).
+    setOpenMaps((prev) => prev.map((m) => (m.address === oldAddress ? updated : m)));
+    if (activeMapAddress === oldAddress) setActiveMapAddress(def.address);
+  };
+
   // Handler pour sauvegarder les paramètres d'affichage d'une map
   const handleSaveMapDisplaySettings = (mapAddress: number, settings: MapDisplaySettings) => {
     setMapDisplaySettingsStore(prev => {
@@ -5670,8 +6545,15 @@ await axios.put("/api/versioning/map-edits", { versionId: currentVersionId, edit
   }, [projectData, mapDisplaySettingsStore, handleSaveMapDisplaySettings]);
 
   const toggleFolder = (folderName: string) => {
-    // Block opening sub-folders when mappack is locked (only allow "all" root folder)
-    if (!mappackUnlocked && folderName !== "all") {
+    // Block opening sub-folders when mappack is locked (only allow "all" root
+    // folder). The generic-scan folders ("Potential maps" / "My Maps") are not
+    // part of the mappack, so they open regardless of its lock state.
+    if (
+      !mappackUnlocked &&
+      folderName !== "all" &&
+      folderName !== "__potential__" &&
+      folderName !== "__mymaps__"
+    ) {
       return;
     }
     const newExpanded = new Set(expandedFolders);
@@ -5682,6 +6564,41 @@ await axios.put("/api/versioning/map-edits", { versionId: currentVersionId, edit
     }
     setExpandedFolders(newExpanded);
   };
+
+  // ── Generic-scan folders (unrecognized files) ──────────────────────
+  // Persist detection_data (which now carries my_maps) to the project on disk.
+  const persistDetectionResults = useCallback(async (next: unknown) => {
+    if (!projectData?.fileId) return;
+    try {
+      await axios.patch(`/api/files/${projectData.fileId}`, { detection_data: next });
+    } catch {
+      // Non-fatal: the change stays in memory for this session even if the
+      // write fails (disk full, permissions) — surfaced elsewhere on save.
+    }
+  }, [projectData?.fileId]);
+
+  const addToMyMaps = useCallback((map: MapData) => {
+    if (!projectData) return;
+    const existing = projectData.detectionResults.my_maps || [];
+    if (existing.some((m) => m.address === map.address)) return; // already kept
+    const detectionResults = { ...projectData.detectionResults, my_maps: [...existing, map] };
+    setProjectData({ ...projectData, detectionResults });
+    void persistDetectionResults(detectionResults);
+  }, [projectData, persistDetectionResults]);
+
+  const removeFromMyMaps = useCallback((address: number) => {
+    if (!projectData) return;
+    const existing = projectData.detectionResults.my_maps || [];
+    const my_maps = existing.filter((m) => m.address !== address);
+    const detectionResults = { ...projectData.detectionResults, my_maps };
+    setProjectData({ ...projectData, detectionResults });
+    void persistDetectionResults(detectionResults);
+  }, [projectData, persistDetectionResults]);
+
+  // Manual map creation (available on every file). Modal state here; the
+  // handler is defined after handleMapClick so it can open the new map.
+  const [showCreateMapModal, setShowCreateMapModal] = useState(false);
+  const [createMapPrefill, setCreateMapPrefill] = useState<CreateMapPrefill | undefined>(undefined);
 
   // Handle mappack unlock - show confirmation first
   const handleUnlockMappack = (e: React.MouseEvent<HTMLButtonElement>) => {
@@ -5751,6 +6668,36 @@ await axios.put("/api/versioning/map-edits", { versionId: currentVersionId, edit
     });
     // Définir cette map comme active pour le curseur global
     setActiveMapAddress(map.address);
+  };
+
+  // Add a user-created map to My Maps (persisted) and open it for editing.
+  // Shaped like a detected MapData, so the viewer/hexdump treat it normally —
+  // but it lives in my_maps, never in the trusted detection list.
+  const handleCreateMyMap = (map: CreatedMap) => {
+    setShowCreateMapModal(false);
+    if (!projectData) return;
+    const existing = projectData.detectionResults.my_maps || [];
+    const my_maps = existing.some((m) => m.address === map.address)
+      ? existing.map((m) => (m.address === map.address ? (map as unknown as MapData) : m))
+      : [...existing, map as unknown as MapData];
+    const detectionResults = { ...projectData.detectionResults, my_maps };
+    setProjectData({ ...projectData, detectionResults });
+    void persistDetectionResults(detectionResults);
+    handleMapClick(map as unknown as MapData);
+  };
+
+  // Open the create-map modal seeded from a hexdump byte selection: start
+  // address, value size and byte order taken from the current hexdump view,
+  // opened as a 1D curve of the selected length (the user can switch to 2D).
+  const handleCreateMapFromSelection = (startByte: number, byteCount: number) => {
+    const bpv = hexdumpSize === "16b" ? 2 : 1;
+    setCreateMapPrefill({
+      address: startByte,
+      bits: bpv === 2 ? 16 : 8,
+      length: Math.max(1, Math.floor(byteCount / bpv)),
+      littleEndian: hexdumpByteOrder === "lohi",
+    });
+    setShowCreateMapModal(true);
   };
 
   const handleCloseMapWindow = (mapAddress: number) => {
@@ -5991,6 +6938,17 @@ await axios.put("/api/versioning/map-edits", { versionId: currentVersionId, edit
     if (!activeMapAddress) {
       setIsHexdumpActive(true);
     }
+  };
+
+  // Center the hexdump on a candidate and bring it forward. Used by the
+  // "Potential maps" / "My Maps" rows, which are locators into the hexdump
+  // rather than editable maps. Defined here (after handleExpandHexdump /
+  // bringHexdumpToFront) to avoid a temporal-dead-zone reference.
+  const locateInHexdump = (address: number) => {
+    setHexdumpScrollToAddress(address);
+    setHexdumpScrollKey((prev) => prev + 1);
+    handleExpandHexdump();
+    bringHexdumpToFront();
   };
 
   // Handler pour toggle la fenêtre Preview
@@ -6525,6 +7483,134 @@ await axios.put("/api/versioning/map-edits", { versionId: currentVersionId, edit
               </button>
             </div>
 
+            {/* Potential maps + My Maps — only for files scanned by the generic
+                heuristic (unrecognized ECUs). Sits between Hexdump and Mappack.
+                Rows LOCATE the candidate in the hexdump (they are not trusted,
+                editable maps); "My Maps" is the subset the user keeps. */}
+            {(() => {
+              const potentialMaps = projectData.detectionResults?.potential_maps ?? [];
+              const myMaps = projectData.detectionResults?.my_maps ?? [];
+              const keptAddrs = new Set(myMaps.map((m) => m.address));
+              const rowText = theme === 'light' ? 'rgba(0,0,0,0.7)' : 'rgba(255,255,255,0.7)';
+              const rowStrong = theme === 'light' ? 'rgba(0,0,0,0.9)' : 'rgba(255,255,255,0.9)';
+              const dimColor = theme === 'light' ? 'rgba(0,0,0,0.4)' : 'rgba(255,255,255,0.4)';
+              const actionColor = theme === 'light' ? 'rgba(0,0,0,0.55)' : 'rgba(255,255,255,0.55)';
+              const badgeStyle = {
+                color: dimColor,
+                backgroundColor: theme === 'light' ? 'rgba(255,255,255,0.7)' : 'rgba(255,255,255,0.045)',
+                borderColor: getBorderColor(),
+                minWidth: '26px',
+              } as const;
+              const dims = (map: MapData) =>
+                map.dimensions?.TwoDimensional
+                  ? `${map.dimensions.TwoDimensional.cols}x${map.dimensions.TwoDimensional.rows}`
+                  : map.dimensions?.OneDimensional
+                    ? `${map.dimensions.OneDimensional.length}x1`
+                    : '';
+              const renderRow = (map: MapData, i: number, kind: 'potential' | 'mymaps') => {
+                const kept = keptAddrs.has(map.address);
+                return (
+                  <div key={`${kind}-${i}`} className={`flex items-center gap-1 rounded ${theme === 'light' ? 'hover:bg-black/5' : 'hover:bg-white/5'}`}>
+                    <button
+                      onClick={() => kind === 'mymaps' ? handleMapClick(map) : locateInHexdump(map.address)}
+                      className="flex items-center gap-2 flex-1 min-w-0 px-2 py-1.5 text-left focus:outline-none"
+                      style={{ color: rowText }}
+                      title={kind === 'mymaps' ? 'Open in editor' : 'Locate in hexdump'}
+                    >
+                      <FileText className="w-3 h-3 flex-shrink-0" />
+                      <span className="text-xs truncate flex-1">
+                        <span className="font-mono" style={{ color: getTextColor() }}>{map.address.toString(16).toUpperCase()}</span>
+                        <span className="mx-1">-</span>
+                        <span style={{ color: rowStrong }}>{map.name}</span>
+                      </span>
+                      {dims(map) && (
+                        <span className="text-xs font-mono flex-shrink-0" style={{ color: dimColor }}>{dims(map)}</span>
+                      )}
+                    </button>
+                    {kind === 'potential' ? (
+                      <button
+                        onClick={() => addToMyMaps(map)}
+                        disabled={kept}
+                        title={kept ? 'Already in My Maps' : 'Add to My Maps'}
+                        className={`flex-shrink-0 mr-1 h-6 w-6 flex items-center justify-center rounded-md transition-colors ${kept ? 'opacity-40 cursor-default' : (theme === 'light' ? 'hover:bg-black/10' : 'hover:bg-white/10')}`}
+                        style={{ color: actionColor }}
+                      >
+                        {kept ? <Star className="w-3.5 h-3.5" fill="currentColor" /> : <Plus className="w-4 h-4" />}
+                      </button>
+                    ) : (
+                      <button
+                        onClick={() => removeFromMyMaps(map.address)}
+                        title="Remove from My Maps"
+                        className={`flex-shrink-0 mr-1 h-6 w-6 flex items-center justify-center rounded-md transition-colors ${theme === 'light' ? 'hover:bg-black/10' : 'hover:bg-white/10'}`}
+                        style={{ color: actionColor }}
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    )}
+                  </div>
+                );
+              };
+              return (
+                <>
+                  {/* Potential maps (heuristic candidates) */}
+                  {potentialMaps.length > 0 && (
+                    <div>
+                      <button
+                        onClick={() => toggleFolder('__potential__')}
+                        className={`flex items-center gap-2 w-full px-2 py-1.5 rounded transition-colors ${theme === 'light' ? 'hover:bg-black/5' : 'hover:bg-white/5'}`}
+                      >
+                        <ChevronRight className={`w-4 h-4 transition-transform duration-200 ${expandedFolders.has('__potential__') ? 'rotate-90' : ''}`} style={{ color: getTextColor() }} />
+                        {expandedFolders.has('__potential__')
+                          ? <FolderOpen className={`w-4 h-4 ${theme === 'light' ? 'text-amber-600' : 'text-yellow-500'}`} />
+                          : <Folder className={`w-4 h-4 ${theme === 'light' ? 'text-amber-600' : 'text-yellow-500'}`} />}
+                        <span className="text-sm" style={{ color: theme === 'light' ? '#000000' : 'rgba(255,255,255,0.7)' }}>Potential maps</span>
+                        <span className="text-[10px] ml-auto px-1.5 rounded-full border tabular-nums text-center" style={badgeStyle}>{potentialMaps.length}</span>
+                      </button>
+                      <div className={`overflow-hidden transition-all duration-300 ease-in-out ${expandedFolders.has('__potential__') ? 'max-h-[20000px] opacity-100' : 'max-h-0 opacity-0'}`}>
+                        <div className="ml-1 mt-1 space-y-0.5">
+                          {/* 400 rows max — only mounted while expanded */}
+                          {expandedFolders.has('__potential__') && potentialMaps.map((m, i) => renderRow(m, i, 'potential'))}
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* My Maps (user-created + kept candidates) — available on
+                      every file, with a "New map" button to define one by hand */}
+                  <div>
+                    <div className="flex items-center gap-1">
+                      <button
+                        onClick={() => toggleFolder('__mymaps__')}
+                        className={`flex items-center gap-2 flex-1 min-w-0 px-2 py-1.5 rounded transition-colors ${theme === 'light' ? 'hover:bg-black/5' : 'hover:bg-white/5'}`}
+                      >
+                        <ChevronRight className={`w-4 h-4 transition-transform duration-200 ${expandedFolders.has('__mymaps__') ? 'rotate-90' : ''}`} style={{ color: getTextColor() }} />
+                        <Star className={`w-4 h-4 ${theme === 'light' ? 'text-amber-600' : 'text-yellow-500'}`} />
+                        <span className="text-sm" style={{ color: theme === 'light' ? '#000000' : 'rgba(255,255,255,0.7)' }}>My Maps</span>
+                        <span className="text-[10px] ml-auto px-1.5 rounded-full border tabular-nums text-center" style={badgeStyle}>{myMaps.length}</span>
+                      </button>
+                      <button
+                        onClick={() => { setCreateMapPrefill(undefined); setShowCreateMapModal(true); }}
+                        title="Create a new map"
+                        className={`flex-shrink-0 mr-1 h-6 w-6 flex items-center justify-center rounded-md transition-colors ${theme === 'light' ? 'hover:bg-black/10' : 'hover:bg-white/10'}`}
+                        style={{ color: actionColor }}
+                      >
+                        <Plus className="w-4 h-4" />
+                      </button>
+                    </div>
+                    <div className={`overflow-hidden transition-all duration-300 ease-in-out ${expandedFolders.has('__mymaps__') ? 'max-h-[20000px] opacity-100' : 'max-h-0 opacity-0'}`}>
+                      <div className="ml-1 mt-1 space-y-0.5">
+                        {myMaps.length === 0 ? (
+                          <div className="px-2 py-1.5 text-xs" style={{ color: dimColor }}>Create a map with +, or add a candidate from Potential maps</div>
+                        ) : (
+                          myMaps.map((m, i) => renderRow(m, i, 'mymaps'))
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                </>
+              );
+            })()}
+
             {/* User maps Folder - ne change jamais de couleur */}
             <div>
               <div className="flex items-center gap-1">
@@ -6795,6 +7881,20 @@ await axios.put("/api/versioning/map-edits", { versionId: currentVersionId, edit
             onHexdumpByteOrderChange={setHexdumpByteOrder}
             onHexdumpFormatChange={setHexdumpFormat}
             onEasyViewModeChange={setEasyViewMode}
+            hexDisplayMode={hexDisplayMode}
+            onHexDisplayModeChange={setHexDisplayMode}
+            hexChangeCount={hexChangeAddrs.length}
+            hexChangeIndex={hexChangeIndex}
+            onHexPrevChange={() => stepHexChange(-1)}
+            onHexNextChange={() => stepHexChange(1)}
+            canUndo={canUndo}
+            canRedo={canRedo}
+            onUndo={undoEdit}
+            onRedo={redoEdit}
+            hexStep={hexStep}
+            onHexStepChange={setHexStep}
+            hexStepMode={hexStepMode}
+            onHexStepModeChange={setHexStepMode}
             onPreviewClick={handlePreviewToggle}
             onSettingsClick={() => setIsSettingsOpen(true)}
             zoomPercent={Math.round(effectiveZoom * 100)}
@@ -7021,6 +8121,8 @@ await axios.put("/api/versioning/map-edits", { versionId: currentVersionId, edit
                 settings={getMapDisplaySettings(mapPropertiesTarget)}
                 onClose={handleCloseMapPropertiesModal}
                 onSave={(settings) => handleSaveMapDisplaySettings(mapPropertiesTarget.address, settings)}
+                isUserMap={(projectData?.detectionResults?.my_maps || []).some((m) => m.address === mapPropertiesTarget.address)}
+                onSaveDefinition={(def) => handleSaveMapDefinition(mapPropertiesTarget.address, def)}
                 isClosing={isClosingMapPropertiesModal}
                 theme={theme}
                 workspaceRef={workspaceRef}
@@ -7116,9 +8218,10 @@ await axios.put("/api/versioning/map-edits", { versionId: currentVersionId, edit
                       height: hexdumpLayout.height,
                       // Largeur min = contenu complet du mode courant : l'ASCII
                       // et la minimap ne peuvent jamais être rognés au resize.
+                      // Pas de maxWidth : la fenêtre peut s'agrandir librement
+                      // (le resize est borné à l'espace de travail au relâché).
                       minWidth: HEXDUMP_WINDOW_WIDTH[hexdumpSize],
                       minHeight: 105,
-                      maxWidth: HEXDUMP_WINDOW_WIDTH[hexdumpSize] + 80,
                       resize: "both",
                       overflow: "hidden",
                       zIndex: hexdumpZIndex,
@@ -7143,6 +8246,17 @@ await axios.put("/api/versioning/map-edits", { versionId: currentVersionId, edit
                         <span className="text-sm font-semibold">Hexdump</span>
                       </div>
                       <div className="flex items-center gap-2">
+                        {hexZoom !== 1 && (
+                          <button
+                            onClick={() => setHexZoom(1)}
+                            onMouseDown={(e) => e.stopPropagation()}
+                            title="Hexdump zoom (Ctrl+scroll) — click to reset"
+                            className={`text-[11px] px-1.5 h-6 rounded font-mono ${getButtonHoverClass()}`}
+                            style={{ color: getWindowHeaderTextColor() }}
+                          >
+                            {Math.round(hexZoom * 100)}%
+                          </button>
+                        )}
                         <Button
                           variant="ghost"
                           size="sm"
@@ -7156,7 +8270,22 @@ await axios.put("/api/versioning/map-edits", { versionId: currentVersionId, edit
                         </Button>
                       </div>
                     </div>
-                    <div className="flex-1 min-h-[260px] overflow-hidden relative">
+                    <div
+                      ref={hexZoomAreaRef}
+                      className="flex-1 min-h-[260px] overflow-hidden relative"
+                      onMouseEnter={() => { hexHoverRef.current = true; }}
+                      onMouseLeave={() => { hexHoverRef.current = false; }}
+                    >
+                      {/* Ctrl+scroll zoom: scale the viewer to 1/zoom then up by
+                          zoom, so it fills the pane but renders larger/smaller. */}
+                      <div
+                        style={{
+                          transformOrigin: "top left",
+                          transform: `scale(${hexZoom})`,
+                          width: `${100 / hexZoom}%`,
+                          height: `${100 / hexZoom}%`,
+                        }}
+                      >
                       <HexdumpViewer
                         fileData={hexdumpDisplayData.length > 0 ? hexdumpDisplayData : projectData.file_data}
                         originalFileData={originalFileDataRef.current ?? undefined}
@@ -7167,15 +8296,36 @@ await axios.put("/api/versioning/map-edits", { versionId: currentVersionId, edit
                         containerWidth="100%"
                         minWidthOverride="0px"
                         theme={theme}
-                        mapRegions={mappackUnlocked ? projectData.detectionResults.maps.map(m => ({
-                          name: m.name,
-                          address: m.address,
-                          size: m.size,
-                          codeblock_id: m.codeblock_id,
-                          dimensions: m.dimensions,
-                        })) : []}
+                        mapRegions={mappackUnlocked ? [
+                          ...projectData.detectionResults.maps.map(m => ({
+                            name: m.name,
+                            address: m.address,
+                            size: m.size,
+                            codeblock_id: m.codeblock_id,
+                            dimensions: m.dimensions,
+                          })),
+                          // Candidats du scanner heuristique (fichiers non
+                          // reconnus) : préfixés « ? » pour bien les distinguer
+                          // des maps détectées de confiance.
+                          ...(projectData.detectionResults.potential_maps || []).map(m => ({
+                            name: `? ${m.name}`,
+                            address: m.address,
+                            size: m.size,
+                            codeblock_id: m.codeblock_id,
+                            dimensions: m.dimensions,
+                          })),
+                          // Cartes créées / retenues par l'utilisateur (My Maps),
+                          // préfixées « ★ » pour les distinguer.
+                          ...(projectData.detectionResults.my_maps || []).map(m => ({
+                            name: `★ ${m.name}`,
+                            address: m.address,
+                            size: m.size,
+                            codeblock_id: m.codeblock_id,
+                            dimensions: m.dimensions,
+                          })),
+                        ] : []}
                         selectedMapAddress={hexdumpScrollToAddress}
-                        onScrollComplete={() => setHexdumpScrollToAddress(null)}
+                        onScrollComplete={handleHexScrollComplete}
                         onMapClick={(mapRegion) => {
                           const map = projectData.detectionResults.maps.find(m => m.address === mapRegion.address);
                           if (map) handleMapClick(map);
@@ -7186,7 +8336,22 @@ await axios.put("/api/versioning/map-edits", { versionId: currentVersionId, edit
                         scrollKey={hexdumpScrollKey}
                         onSearchClick={() => setShowSearchModal(true)}
                         searchButtonLabel={t.search?.button || "Search"}
+                        onCreateMapFromSelection={handleCreateMapFromSelection}
+                        createMapLabel="Create map"
+                        displayMode={hexDisplayMode}
+                        onDiffAddressesChange={handleHexDiffAddresses}
+                        onSelectionStartChange={handleHexSelectionStart}
+                        currentChangeAddress={hexCurrentChangeAddr}
+                        onValueEdit={handleHexValueEdit}
+                        onValuesFill={handleHexValuesFill}
+                        onValuesRestore={handleHexValuesRestore}
+                        onValuesPaste={handleHexValuesPaste}
+                        onValuesAdjust={handleHexValuesAdjust}
+                        onContentWidthChange={handleHexContentWidth}
+                        columns={hexColumns}
+                        onColumnsChange={setHexColumns}
                       />
+                      </div>
                       {/* Resize handle overlay - prevents scroll interference */}
                       <div
                         className="absolute bottom-0 right-0 w-4 h-4 cursor-se-resize"
@@ -7352,6 +8517,7 @@ await axios.put("/api/versioning/map-edits", { versionId: currentVersionId, edit
                             key={map.address}
                             mapData={map}
                             fileData={projectData.file_data}
+                            originalFileData={originalFileDataRef.current ?? undefined}
                             projectName={projectData.project_name}
                             fileName={projectData.file_name}
                             viewMode={mapViewModes.get(map.address) || "text"}
@@ -7744,6 +8910,11 @@ await axios.put("/api/versioning/map-edits", { versionId: currentVersionId, edit
           // État « déjà actif » : les cartes issues de la détection — le
           // détecteur n'expose « Launch control map » que si elle est activée
           detectedMaps={projectData.detectionResults?.maps || []}
+          // Custom solutions: make-your-own from a file version
+          customSolutions={customSolutions}
+          versions={versions.map(v => ({ id: v.id, name: v.name }))}
+          onCreateSolutionFromVersion={handleCreateSolutionFromVersion}
+          onDeleteCustomSolution={handleDeleteCustomSolution}
           onClose={() => {
             setIsSolutionsClosing(true);
             setTimeout(() => {
@@ -7779,6 +8950,38 @@ await axios.put("/api/versioning/map-edits", { versionId: currentVersionId, edit
 
             for (const solutionId of solutionIds) {
               if (solutionId in usedSolutions) continue;
+
+              // Custom (user-made) solution: locate the matching region in THIS
+              // file (search + verify), then write the patches at that offset.
+              const custom = customSolutions.find(s => s.id === solutionId);
+              if (custom) {
+                const delta = locateCustomSolution(currentData, custom);
+                if (delta === null) {
+                  toast({
+                    title: t.errors.noMapsFound || "Solution not applied",
+                    description: `${custom.name}: no matching region found in this file.`,
+                    variant: "destructive",
+                  });
+                  continue;
+                }
+                let applied = 0;
+                for (const patch of custom.patches) {
+                  for (let i = 0; i < patch.data.length; i++) {
+                    const addr = patch.address + delta + i;
+                    if (addr >= 0 && addr < currentData.length) {
+                      currentData[addr] = patch.data[i] & 0xff;
+                      allChangedAddresses.push(addr);
+                      applied++;
+                    }
+                  }
+                }
+                if (applied === 0) {
+                  toast({ title: t.errors.noMapsFound, description: custom.name, variant: "destructive" });
+                  continue;
+                }
+                appliedSolutions.push(solutionId);
+                continue;
+              }
 
               const impl = getSolutionImplementation(solutionId);
               if (!impl) continue;
@@ -8056,6 +9259,9 @@ await axios.put("/api/versioning/map-edits", { versionId: currentVersionId, edit
         originalFileData={originalFileDataRef.current || []}
         currentFileData={hexdumpDisplayData.length > 0 ? hexdumpDisplayData : undefined}
         resolveVersionData={buildVersionFileData}
+        externalProjects={compareExternalProjects}
+        resolveExternalVersionData={resolveExternalVersionData}
+        currentProjectName={projectData?.project_name}
         hexdumpSize={hexdumpSize}
         hexdumpFormat={hexdumpFormat}
         hexdumpByteOrder={hexdumpByteOrder}
@@ -8068,6 +9274,20 @@ await axios.put("/api/versioning/map-edits", { versionId: currentVersionId, edit
         })) || []}
         ecuType={projectData?.ecu_type}
       />
+
+      {/* Create Map Modal — manual map definition (My Maps, all files).
+          Mounted only while open so a new selection re-seeds the form. */}
+      {showCreateMapModal && (
+        <CreateMapModal
+          isOpen
+          onClose={() => setShowCreateMapModal(false)}
+          onCreate={handleCreateMyMap}
+          theme={theme}
+          defaultLittleEndian={hexdumpByteOrder === 'lohi'}
+          fileSize={projectData?.file_data?.length ?? 0}
+          prefill={createMapPrefill}
+        />
+      )}
 
       {/* Checksum Modal */}
       {isChecksumModalOpen && (

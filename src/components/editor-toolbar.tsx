@@ -8,6 +8,10 @@ import {
   Zap,
   ChevronDown,
   Check,
+  ChevronLeft,
+  ChevronRight,
+  Undo2,
+  Redo2,
 } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { useTheme } from "@/contexts/theme-context";
@@ -32,6 +36,23 @@ interface EditorToolbarProps {
   onHexdumpByteOrderChange?: (order: "hilo" | "lohi") => void;
   onHexdumpFormatChange?: (format: "hex" | "dec") => void;
   onEasyViewModeChange?: (enabled: boolean) => void;
+  // Hexdump cell display + changed-byte navigation
+  hexDisplayMode?: "modified" | "original" | "percent";
+  onHexDisplayModeChange?: (mode: "modified" | "original" | "percent") => void;
+  hexChangeCount?: number;
+  hexChangeIndex?: number;
+  onHexPrevChange?: () => void;
+  onHexNextChange?: () => void;
+  // Undo / redo of edits (maps, hexdump, axes)
+  canUndo?: boolean;
+  canRedo?: boolean;
+  onUndo?: () => void;
+  onRedo?: () => void;
+  // Step applied to selected hexdump values with the +/- keys
+  hexStep?: string;
+  onHexStepChange?: (value: string) => void;
+  hexStepMode?: "value" | "percent";
+  onHexStepModeChange?: (mode: "value" | "percent") => void;
   onPreviewClick?: () => void;
   onSettingsClick?: () => void;
   // Zoom de l'éditeur (webview) — affiché à gauche du bouton paramètres
@@ -64,6 +85,20 @@ export function EditorToolbar({
   onHexdumpByteOrderChange,
   onHexdumpFormatChange,
   onEasyViewModeChange,
+  hexDisplayMode = "modified",
+  onHexDisplayModeChange,
+  hexChangeCount = 0,
+  hexChangeIndex = 0,
+  onHexPrevChange,
+  onHexNextChange,
+  canUndo = false,
+  canRedo = false,
+  onUndo,
+  onRedo,
+  hexStep = "1",
+  onHexStepChange,
+  hexStepMode = "value",
+  onHexStepModeChange,
   onPreviewClick,
   onSettingsClick,
   zoomPercent = 100,
@@ -289,6 +324,112 @@ export function EditorToolbar({
           >
             Dec
           </Button>
+        </div>
+
+        {/* Hexdump cell display (Mod / Ori / %) + changed-byte navigation */}
+        <div className="flex items-center rounded-lg px-0.5 sm:px-1 flex-shrink-0 ml-0.5 sm:ml-1" style={{ background: getButtonBg(), border: `1px solid ${getBorderColor()}` }}>
+          {(['modified', 'original', 'percent'] as const).map((m) => (
+            <Button
+              key={m}
+              variant="ghost"
+              size="sm"
+              onClick={() => onHexDisplayModeChange?.(m)}
+              className={`h-7 px-1.5 sm:px-2 text-xs ${hexDisplayMode === m ? "bg-blue-600/40 text-white-500 hover:bg-blue-400/40" : getButtonHoverClass()}`}
+              style={{ color: hexDisplayMode === m ? (theme === 'light' ? '#000000' : undefined) : getTextColor() }}
+              title={m === 'modified' ? 'Show current (modified) values' : m === 'original' ? 'Show original values' : 'Show % change vs original'}
+            >
+              {m === 'modified' ? 'Mod' : m === 'original' ? 'Ori' : '%'}
+            </Button>
+          ))}
+          <div className="w-px h-5 mx-0.5 sm:mx-1" style={{ background: theme === 'light' ? '#dee2e6' : 'rgba(255, 255, 255, 0.1)' }}></div>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={onHexPrevChange}
+            disabled={hexChangeCount === 0}
+            className={`h-7 w-6 p-0 ${hexChangeCount ? getButtonHoverClass() : "opacity-40 cursor-not-allowed"}`}
+            style={{ color: getTextColor() }}
+            title="Previous change (V)"
+          >
+            <ChevronLeft className="w-3.5 h-3.5" />
+          </Button>
+          <span className="text-xs tabular-nums text-center px-0.5" style={{ color: getTextColor(), minWidth: '46px' }} title="Changed bytes vs original">
+            {hexChangeCount > 0 ? `${Math.min(hexChangeIndex, hexChangeCount - 1) + 1}/${hexChangeCount}` : '0'}
+          </span>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={onHexNextChange}
+            disabled={hexChangeCount === 0}
+            className={`h-7 w-6 p-0 ${hexChangeCount ? getButtonHoverClass() : "opacity-40 cursor-not-allowed"}`}
+            style={{ color: getTextColor() }}
+            title="Next change (N)"
+          >
+            <ChevronRight className="w-3.5 h-3.5" />
+          </Button>
+          <div className="w-px h-5 mx-0.5 sm:mx-1" style={{ background: theme === 'light' ? '#dee2e6' : 'rgba(255, 255, 255, 0.1)' }}></div>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={onUndo}
+            disabled={!canUndo}
+            className={`h-7 w-6 p-0 ${canUndo ? getButtonHoverClass() : "opacity-40 cursor-not-allowed"}`}
+            style={{ color: getTextColor() }}
+            title="Undo (Ctrl+Z)"
+          >
+            <Undo2 className="w-3.5 h-3.5" />
+          </Button>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={onRedo}
+            disabled={!canRedo}
+            className={`h-7 w-6 p-0 ${canRedo ? getButtonHoverClass() : "opacity-40 cursor-not-allowed"}`}
+            style={{ color: getTextColor() }}
+            title="Redo (Ctrl+Y)"
+          >
+            <Redo2 className="w-3.5 h-3.5" />
+          </Button>
+          <div className="w-px h-5 mx-0.5 sm:mx-1" style={{ background: theme === 'light' ? '#dee2e6' : 'rgba(255, 255, 255, 0.1)' }}></div>
+          <div
+            className="flex items-center gap-1"
+            title={
+              hexStepMode === "percent"
+                ? "Step for + / − on selected values (percent of each value)"
+                : `Step for + / − on selected values (${hexdumpFormat === "hex" ? "hex" : "decimal"})`
+            }
+          >
+            <span className="text-xs font-semibold" style={{ color: getTextColor() }}>±</span>
+            <input
+              type="text"
+              inputMode={hexStepMode === "percent" ? "decimal" : (hexdumpFormat === "hex" ? "text" : "numeric")}
+              value={hexStep}
+              onChange={(e) => onHexStepChange?.(
+                hexStepMode === "percent"
+                  ? e.target.value.replace(/[^0-9.]/g, "")
+                  : hexdumpFormat === "hex"
+                    ? e.target.value.replace(/[^0-9a-fA-F]/g, "").toUpperCase()
+                    : e.target.value.replace(/[^0-9]/g, "")
+              )}
+              onKeyDown={(e) => e.stopPropagation()}
+              className="w-14 h-7 text-center text-xs font-mono rounded outline-none"
+              style={{
+                color: getTextColor(),
+                background: theme === 'light' ? '#fff' : 'rgba(255,255,255,0.06)',
+                border: `1px solid ${theme === 'light' ? 'rgba(0,0,0,0.12)' : 'rgba(255,255,255,0.12)'}`,
+              }}
+            />
+            <button
+              onClick={() => onHexStepModeChange?.(hexStepMode === "percent" ? "value" : "percent")}
+              title="Toggle + / − step unit: value ⇄ percent"
+              className={`h-7 w-7 p-0 text-[11px] font-semibold rounded ${getButtonHoverClass()}`}
+              style={{
+                color: hexStepMode === "percent" ? (theme === 'light' ? '#166534' : '#86efac') : getTextColor(),
+              }}
+            >
+              {hexStepMode === "percent" ? "%" : (hexdumpFormat === "hex" ? "h" : "d")}
+            </button>
+          </div>
         </div>
 
 

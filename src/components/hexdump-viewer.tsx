@@ -43,6 +43,46 @@ interface HexdumpViewerProps {
   // Search button
   onSearchClick?: () => void; // Callback when search button is clicked
   searchButtonLabel?: string; // Label for the search button (i18n)
+  // "Create map from selection": when provided, a toggle appears that lets the
+  // user drag-select a byte range and turn it into a map. The callback gets the
+  // selection's start byte and its length in bytes.
+  onCreateMapFromSelection?: (startByte: number, byteCount: number) => void;
+  createMapLabel?: string;
+  // Reports the start byte of the current cell selection (drag-select works in
+  // the hexdump at all times, not only in create-map mode) so the toolbar's
+  // change navigator can start counting differences from the selected byte.
+  // null when the selection is cleared.
+  onSelectionStartChange?: (startByte: number | null) => void;
+  // The difference the toolbar's ◀/▶ navigator last jumped to: outlined in
+  // yellow so the current change stands out. null = none.
+  currentChangeAddress?: number | null;
+  // Per-cell display (controlled from the editor toolbar): current bytes,
+  // original bytes, or % change vs original.
+  displayMode?: "modified" | "original" | "percent";
+  // Reports the sorted list of changed byte addresses (current vs original) so
+  // the toolbar's change navigator can jump between them.
+  onDiffAddressesChange?: (addrs: number[]) => void;
+  // Inline byte editing: double-click a value cell, type a new value (in the
+  // current hex/dec format), Enter to commit. Gives the value's byte offset and
+  // the new value (8- or 16-bit per the current word size).
+  onValueEdit?: (byteOffset: number, newValue: number) => void;
+  // Bulk edit: with values selected, ENTER types one value applied to EVERY
+  // selected value. Gets the list of selected value-start byte offsets.
+  onValuesFill?: (addrs: number[], newValue: number) => void;
+  // Restore selection to stock (F11): sets every selected value back to the
+  // original file's bytes. Gets the selected value-start byte offsets.
+  onValuesRestore?: (addrs: number[]) => void;
+  // Paste (Ctrl+V): write consecutive values starting at startByte.
+  onValuesPaste?: (startByte: number, values: number[]) => void;
+  // + / - : adjust every selected value by (sign × toolbar step). sign is +1/-1.
+  onValuesAdjust?: (addrs: number[], sign: 1 | -1) => void;
+  // Reports the pixel width the value grid needs (grows with the columns count)
+  // so the host window can expand to fit it.
+  onContentWidthChange?: (px: number) => void;
+  // Persisted "values per row": `columns` seeds/updates it from saved project
+  // settings; `onColumnsChange` reports the current value back for saving.
+  columns?: number;
+  onColumnsChange?: (columns: number) => void;
 }
 
 // Single color for all maps - solid gray with border
@@ -93,16 +133,46 @@ interface HexRowProps {
   bytesPerValue: number;
   valuesPerRow: number;
   bytesPerRow: number;
+  // Which data to show per cell: current ("modified"), the original bytes, or
+  // the % change vs original. Diff colouring stays consistent across modes.
+  displayMode: "modified" | "original" | "percent";
   byteToMapInfo: Map<number, ByteMapInfo>;
   byteToSearchInfo: Map<number, ByteSearchInfo>;
   // The hovered map ONLY when it intersects this row, null otherwise —
   // keeps the memo effective for every other row.
   hoveredMap: MapRegion | null;
+  // Byte-selection (Create map from selection). selStartVal/selEndVal are the
+  // min/max value-start byte offsets of the current selection (null = none).
+  selectMode: boolean;
+  selStartVal: number | null;
+  selEndVal: number | null;
+  // Discontiguous selection (Shift+Alt+D); when non-null it supersedes the range.
+  selectedSet: Set<number> | null;
+  // Grid alignment shift in bytes (Ctrl+←/→). The row's first column maps to
+  // file byte `rowIndex*bytesPerRow - alignOffset`; negative offsets render blank
+  // so a map's values can be lined up to a column boundary.
+  alignOffset: number;
+  // Byte address of the difference the change-navigator is currently on.
+  currentChangeAddress: number | null;
   onByteClick: (byteAddress: number) => void;
   onByteHover: (byteAddress: number | null) => void;
   onLabelClick: (mapRegion: MapRegion) => void;
   onLabelHover: (mapRegion: MapRegion | null) => void;
+  onCellSelectDown: (byteAddress: number) => void;
+  onCellSelectEnter: (byteAddress: number) => void;
+  // Inline editing: -1 when no cell in this row is being edited.
+  editable: boolean;
+  editingByteOffset: number;
+  editDraft: string;
+  onEditStart: (byteAddress: number) => void;
+  onEditChange: (value: string) => void;
+  onEditCommit: () => void;
+  onEditCancel: () => void;
 }
+
+// Selection highlight (Create map from selection) — a calm blue, distinct
+// from the map gray and the search gold.
+const SELECT_COLOR = { bg: '#2f5fb0', text: '#ffffff' };
 
 // One hexdump row. Memoized: during scrolling the already-mounted rows keep
 // strictly identical props (stable maps/handlers from the parent), so React
@@ -125,13 +195,29 @@ const HexRow = memo(function HexRow({
   bytesPerValue,
   valuesPerRow,
   bytesPerRow,
+  displayMode,
   byteToMapInfo,
   byteToSearchInfo,
   hoveredMap,
+  selectMode,
+  selStartVal,
+  selEndVal,
+  selectedSet,
+  alignOffset,
+  currentChangeAddress,
   onByteClick,
   onByteHover,
   onLabelClick,
   onLabelHover,
+  onCellSelectDown,
+  onCellSelectEnter,
+  editable,
+  editingByteOffset,
+  editDraft,
+  onEditStart,
+  onEditChange,
+  onEditCommit,
+  onEditCancel,
 }: HexRowProps) {
   const textColor = theme === 'light' ? '#000000' : '#ffffff';
   const addressColor = theme === 'light' ? '#000000' : '#e1e1e1';
@@ -139,8 +225,8 @@ const HexRow = memo(function HexRow({
   const emptyColor = theme === 'light' ? 'rgba(0, 0, 0, 0.2)' : 'rgba(255, 255, 255, 0.2)';
   const hoverBg = theme === 'light' ? 'rgba(0, 0, 0, 0.05)' : 'rgba(255, 255, 255, 0.05)';
 
-  const startByte = rowIndex * bytesPerRow;
-  const address = startByte.toString(16).toUpperCase().padStart(5, '0');
+  const startByte = rowIndex * bytesPerRow - alignOffset;
+  const address = Math.max(0, startByte).toString(16).toUpperCase().padStart(5, '0');
 
   const values: JSX.Element[] = [];
   const asciiValues: JSX.Element[] = [];
@@ -149,6 +235,7 @@ const HexRow = memo(function HexRow({
   const mapStartsInRow: { mapRegion: MapRegion; byteOffset: number }[] = [];
   for (let j = 0; j < bytesPerRow; j++) {
     const byteOffset = startByte + j;
+    if (byteOffset < 0) continue;
     const mapInfo = byteToMapInfo.get(byteOffset);
     if (mapInfo?.isStart) {
       mapStartsInRow.push({ mapRegion: mapInfo.mapRegion, byteOffset });
@@ -158,10 +245,10 @@ const HexRow = memo(function HexRow({
   // ASCII representation
   for (let j = 0; j < bytesPerRow; j++) {
     const byteOffset = startByte + j;
-    const mapInfo = byteToMapInfo.get(byteOffset);
+    const mapInfo = byteOffset >= 0 ? byteToMapInfo.get(byteOffset) : undefined;
 
     let char = ' ';
-    if (byteOffset < fileDataLength) {
+    if (byteOffset >= 0 && byteOffset < fileDataLength) {
       const byte = fileData[byteOffset];
       char = (byte >= 32 && byte <= 126) ? String.fromCharCode(byte) : '.';
     }
@@ -186,51 +273,67 @@ const HexRow = memo(function HexRow({
     let displayValue = '';
     // -1 = valeur sous l'origine (bleu), +1 = au-dessus (rouge), 0 = intacte
     let diffSign = 0;
-    if (byteOffset + bytesPerValue <= fileDataLength) {
-      let value: number;
+    if (byteOffset >= 0 && byteOffset + bytesPerValue <= fileDataLength) {
+      const cur = size === "8b" ? fileData[byteOffset] : read16(fileData, byteOffset, byteOrder);
+      const hasOrig = !!originalFileData && byteOffset + bytesPerValue <= originalFileData.length;
+      const orig = hasOrig
+        ? (size === "8b" ? originalFileData![byteOffset] : read16(originalFileData!, byteOffset, byteOrder))
+        : cur;
+      // Diff sign (colouring) always reflects current vs original.
+      if (cur > orig) diffSign = 1;
+      else if (cur < orig) diffSign = -1;
 
-      if (size === "8b") {
-        value = fileData[byteOffset];
-        displayValue = format === "hex"
-          ? value.toString(16).toUpperCase().padStart(2, '0')
-          : value.toString(10).padStart(3, '0');
+      const fmt = (v: number) => size === "8b"
+        ? (format === "hex" ? v.toString(16).toUpperCase().padStart(2, '0') : v.toString(10).padStart(3, '0'))
+        : (format === "hex" ? v.toString(16).toUpperCase().padStart(4, '0') : v.toString(10).padStart(5, '0'));
+
+      if (displayMode === "original") {
+        displayValue = fmt(orig);
+      } else if (displayMode === "percent") {
+        if (orig === 0) {
+          displayValue = cur === 0 ? '0' : '±';
+        } else {
+          const pct = Math.round(((cur - orig) / orig) * 100);
+          displayValue = (pct > 0 ? '+' : '') + pct;
+        }
       } else {
-        value = read16(fileData, byteOffset, byteOrder);
-        displayValue = format === "hex"
-          ? value.toString(16).toUpperCase().padStart(4, '0')
-          : value.toString(10).padStart(5, '0');
-      }
-
-      // Comparaison à l'origine au niveau de la VALEUR affichée (8/16 bits)
-      if (originalFileData && byteOffset + bytesPerValue <= originalFileData.length) {
-        const orig = size === "8b"
-          ? originalFileData[byteOffset]
-          : read16(originalFileData, byteOffset, byteOrder);
-        if (value > orig) diffSign = 1;
-        else if (value < orig) diffSign = -1;
+        displayValue = fmt(cur);
       }
     } else {
       displayValue = size === "8b" ? (format === "hex" ? '  ' : '   ') : (format === "hex" ? '    ' : '     ');
     }
 
-    const isInMap = !!mapInfo;
+    // Phantom cell: shifted off the front of the file by the alignment offset.
+    // Blank and non-interactive.
+    const isPhantom = byteOffset < 0;
+    const isInMap = !isPhantom && !!mapInfo;
     const isHovered = hoveredMap !== null && mapInfo?.mapRegion === hoveredMap;
-    const isSearchResult = !!searchInfo;
+    const isSearchResult = !isPhantom && !!searchInfo;
     const isCurrentSearchResult = searchInfo?.isCurrent ?? false;
+    const isSelected = isPhantom ? false : (selectedSet
+      ? selectedSet.has(byteOffset)
+      : (selStartVal !== null && selEndVal !== null &&
+         byteOffset >= selStartVal && byteOffset <= selEndVal));
+    const isCurrentChange = currentChangeAddress !== null && byteOffset === currentChangeAddress;
 
-    // Determine background color: search results take priority over map highlighting
+    // Determine background color: an active byte selection wins, then search
+    // results, then map highlighting.
     let bgColor: string | undefined;
-    if (isSearchResult) {
+    if (isSelected) {
+      bgColor = SELECT_COLOR.bg;
+    } else if (isSearchResult) {
       bgColor = isCurrentSearchResult ? SEARCH_COLOR.currentBg : SEARCH_COLOR.bg;
     } else if (isInMap) {
       bgColor = isHovered ? MAP_COLOR.border : MAP_COLOR.bg;
     }
 
-    // Determine text color. Priorité : recherche (fond doré, texte noir) >
-    // modification vs origine (rouge/bleu WinOLS) > map > normal.
+    // Determine text color. Priorité : sélection > recherche (fond doré, texte
+    // noir) > modification vs origine (rouge/bleu WinOLS) > map > normal.
     const diffColors = theme === 'light' ? DIFF_COLORS.light : DIFF_COLORS.dark;
     let cellTextColor: string;
-    if (isSearchResult) {
+    if (isSelected) {
+      cellTextColor = SELECT_COLOR.text;
+    } else if (isSearchResult) {
       cellTextColor = SEARCH_COLOR.text;
     } else if (diffSign !== 0) {
       cellTextColor = diffSign > 0 ? diffColors.above : diffColors.below;
@@ -240,12 +343,42 @@ const HexRow = memo(function HexRow({
       cellTextColor = displayValue.trim() === '' ? emptyColor : textColor;
     }
 
+    const isEditingCell = editingByteOffset === byteOffset;
+    const cellWidth = size === "16b" ? '2.4rem' : '1.85rem';
     values.push(
+      isEditingCell ? (
+        <input
+          key={`val-${j}`}
+          autoFocus
+          onFocus={(e) => e.currentTarget.select()}
+          value={editDraft}
+          onChange={(e) => onEditChange(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') { e.preventDefault(); onEditCommit(); }
+            else if (e.key === 'Escape') { e.preventDefault(); onEditCancel(); }
+            e.stopPropagation();
+          }}
+          onBlur={onEditCommit}
+          onMouseDown={(e) => e.stopPropagation()}
+          onClick={(e) => e.stopPropagation()}
+          className="text-center font-mono outline-none"
+          style={{
+            width: cellWidth,
+            marginRight: '2px',
+            background: theme === 'light' ? '#fff' : '#000',
+            color: theme === 'light' ? '#000' : '#fff',
+            border: '1px solid #f59e0b',
+            borderRadius: '2px',
+            fontSize: '11px',
+            padding: 0,
+          }}
+        />
+      ) : (
       <div
         key={`val-${j}`}
-        className={`text-center ${isInMap ? 'cursor-pointer' : 'hover:bg-primary/20'}`}
+        className={`text-center ${selectMode ? 'cursor-crosshair' : (editable ? 'cursor-text' : (isInMap ? 'cursor-pointer' : 'hover:bg-primary/20'))}`}
         style={{
-          width: size === "16b" ? '2.4rem' : '1.85rem',
+          width: cellWidth,
           backgroundColor: bgColor,
           color: cellTextColor,
           marginRight: '2px',
@@ -253,15 +386,41 @@ const HexRow = memo(function HexRow({
           borderBottom: isInMap ? `1px solid ${MAP_COLOR.border}` : undefined,
           borderLeft: mapInfo?.isStart ? `1px solid ${MAP_COLOR.border}` : undefined,
           borderRight: mapInfo?.isEnd ? `1px solid ${MAP_COLOR.border}` : undefined,
-          fontWeight: isCurrentSearchResult || diffSign !== 0 ? 'bold' : undefined,
-          borderRadius: isSearchResult ? '2px' : undefined,
+          fontWeight: isCurrentSearchResult || diffSign !== 0 || isCurrentChange ? 'bold' : undefined,
+          borderRadius: isSearchResult || isSelected || isCurrentChange ? '2px' : undefined,
+          // Current change (◀/▶ navigator): yellow outline, drawn inset so it
+          // hugs the cell without shifting layout or being clipped by neighbours.
+          outline: isCurrentChange ? '2px solid #facc15' : undefined,
+          outlineOffset: isCurrentChange ? '-2px' : undefined,
         }}
-        onClick={() => mapInfo && onByteClick(byteOffset)}
-        onMouseEnter={() => onByteHover(byteOffset)}
+        onMouseDown={(e) => {
+          // Left-drag selects bytes, both in create-map mode and normally. Skip
+          // the cell that is currently being edited (its input handles input) and
+          // phantom cells shifted off the front of the file.
+          if (e.button !== 0 || isPhantom) return;
+          if (editingByteOffset === byteOffset) return;
+          e.preventDefault(); // don't start a native text selection while dragging
+          onCellSelectDown(byteOffset);
+        }}
+        onClick={() => {
+          if (selectMode || isPhantom) return; // create-map mode / phantom: no navigate
+          // handleByteClick opens the map underneath, unless a drag just happened.
+          onByteClick(byteOffset);
+        }}
+        onDoubleClick={() => {
+          // Double-click a cell to edit its value in place.
+          if (editable && !isPhantom && byteOffset + bytesPerValue <= fileDataLength) onEditStart(byteOffset);
+        }}
+        onMouseEnter={() => {
+          if (isPhantom) return;
+          onByteHover(byteOffset);
+          onCellSelectEnter(byteOffset);
+        }}
         onMouseLeave={() => onByteHover(null)}
       >
         {displayValue}
       </div>
+      )
     );
   }
 
@@ -357,11 +516,168 @@ export function HexdumpViewer({
   scrollKey = 0,
   onSearchClick,
   searchButtonLabel = "Search",
+  onCreateMapFromSelection,
+  createMapLabel = "Create map",
+  onSelectionStartChange,
+  currentChangeAddress = null,
+  displayMode = "modified",
+  onDiffAddressesChange,
+  onValueEdit,
+  onValuesFill,
+  onValuesRestore,
+  onValuesPaste,
+  onValuesAdjust,
+  onContentWidthChange,
+  columns,
+  onColumnsChange,
 }: HexdumpViewerProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const scrollContentRef = useRef<HTMLDivElement>(null);
+  const headerColsRef = useRef<HTMLDivElement>(null); // offset header, synced to horizontal scroll
   const [visibleRange, setVisibleRange] = useState({ start: 0, end: 100 });
   const [hoveredMap, setHoveredMap] = useState<MapRegion | null>(null);
+  // Number of value columns per row (default 8). Adjustable 1..MAX_COLS so a
+  // full map row can be lined up; wide rows scroll horizontally.
+  const MAX_VALUES_PER_ROW = 512;
+  const [valuesPerRow, setValuesPerRow] = useState(columns && columns > 0 ? columns : 8);
+  const [colInput, setColInput] = useState(String(columns && columns > 0 ? columns : 8));
+  const valuesPerRowRef = useRef(valuesPerRow);
+  valuesPerRowRef.current = valuesPerRow;
+  const hoverRef = useRef(false); // pointer is over the hexdump (gates letter shortcuts)
+  // Apply the persisted column count when it arrives/changes from the project
+  // (does not fire on internal W/M changes — the parent only pushes it on load).
+  useEffect(() => {
+    if (columns != null && columns > 0) setValuesPerRow(columns);
+  }, [columns]);
+  // Keep the Cols field in sync when the column count changes elsewhere (W/M keys).
+  useEffect(() => { setColInput(String(valuesPerRow)); }, [valuesPerRow]);
+  // Commit a new column count locally and report it for persistence.
+  const setColumns = useCallback((n: number) => {
+    const clamped = Math.max(1, Math.min(MAX_VALUES_PER_ROW, n));
+    setValuesPerRow(clamped);
+    onColumnsChange?.(clamped);
+  }, [onColumnsChange]);
+  // W = one column narrower, M = one column wider — while the pointer is over the
+  // hexdump and not typing in a field.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return;
+      const ae = document.activeElement as HTMLElement | null;
+      if (!(hoverRef.current || (!!containerRef.current && !!ae && containerRef.current.contains(ae)))) return;
+      if (ae && (ae.tagName === "INPUT" || ae.tagName === "TEXTAREA" || ae.isContentEditable)) return;
+      const k = e.key.toLowerCase();
+      if (k === "m") { e.preventDefault(); setColumns(valuesPerRowRef.current + 1); }
+      else if (k === "w") { e.preventDefault(); setColumns(valuesPerRowRef.current - 1); }
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [setColumns]);
+  // Grid alignment shift in bytes (Ctrl+←/→), kept within [0, bytesPerRow). Lets
+  // the user nudge the column grid so a map's values line up to a row boundary.
+  const [alignOffset, setAlignOffset] = useState(0);
+
+  // ── Byte selection (Create map from selection) ────────────────────
+  const [selectMode, setSelectMode] = useState(false);
+  const [selAnchor, setSelAnchor] = useState<number | null>(null);
+  const [selFocus, setSelFocus] = useState<number | null>(null);
+  // Discontiguous selection (e.g. Shift+Alt+D = the modified values on screen).
+  // When set it supersedes the contiguous anchor/focus range.
+  const [selectedSet, setSelectedSet] = useState<Set<number> | null>(null);
+  const isSelectingRef = useRef(false);
+  // Inline editing state (handlers defined below, after safeFileData).
+  const [editingByteOffset, setEditingByteOffset] = useState<number | null>(null);
+  const [editDraft, setEditDraft] = useState("");
+  // Dedupes a commit fired by Enter and then again by the resulting blur.
+  const committingRef = useRef(false);
+  // When an edit is a BULK edit (ENTER on a selection), the value is applied to
+  // every value in this frozen range instead of just the edited cell.
+  const [editIsBulk, setEditIsBulk] = useState(false);
+  const bulkAddrsRef = useRef<number[] | null>(null);
+  const editable = displayMode === "modified" && !selectMode && !!onValueEdit;
+  const bytesPerValueSel = size === "8b" ? 1 : 2;
+  const selStartVal = selAnchor === null || selFocus === null ? null : Math.min(selAnchor, selFocus);
+  const selEndVal = selAnchor === null || selFocus === null ? null : Math.max(selAnchor, selFocus);
+  const selByteCount = selStartVal === null || selEndVal === null ? 0 : (selEndVal - selStartVal) + bytesPerValueSel;
+
+  // Distinguishes a click (select one byte, still opens a map) from a drag
+  // (select a range, and suppress the click's map-open). Set on mouse-enter
+  // during a held drag, read and reset by handleByteClick.
+  const draggedRef = useRef(false);
+  const onCellSelectDown = useCallback((byteOffset: number) => {
+    isSelectingRef.current = true;
+    draggedRef.current = false;
+    // Move focus into the hexdump so its keyboard shortcuts (Shift+Alt+D, Ctrl+C/
+    // V, Ctrl+←/→) work immediately after a selection. The cell's preventDefault
+    // otherwise leaves focus on whatever was focused before.
+    scrollContentRef.current?.focus({ preventScroll: true });
+    setSelectedSet(null); // a new drag replaces any discontiguous selection
+    setSelAnchor(byteOffset);
+    setSelFocus(byteOffset);
+  }, []);
+  const onCellSelectEnter = useCallback((byteOffset: number) => {
+    if (isSelectingRef.current) {
+      draggedRef.current = true;
+      setSelFocus(byteOffset);
+    }
+  }, []);
+
+  // End a drag anywhere the mouse is released.
+  useEffect(() => {
+    const up = () => { isSelectingRef.current = false; };
+    document.addEventListener('mouseup', up);
+    return () => document.removeEventListener('mouseup', up);
+  }, []);
+
+  // Report the selection's start byte to the parent (drives "count differences
+  // from the selected byte"). Fires whenever the selection start changes.
+  useEffect(() => {
+    onSelectionStartChange?.(selStartVal);
+  }, [selStartVal, onSelectionStartChange]);
+
+  const clearSelection = useCallback(() => {
+    setSelAnchor(null);
+    setSelFocus(null);
+    setSelectedSet(null);
+    isSelectingRef.current = false;
+  }, []);
+
+  // The selected value-start byte offsets, from the discontiguous set if present
+  // (Shift+Alt+D), otherwise the contiguous anchor→focus range.
+  const getSelectedAddrs = useCallback((): number[] => {
+    if (selectedSet && selectedSet.size) return Array.from(selectedSet).sort((a, b) => a - b);
+    if (selStartVal !== null && selEndVal !== null) {
+      const bpv = size === "8b" ? 1 : 2;
+      const arr: number[] = [];
+      for (let a = selStartVal; a <= selEndVal; a += bpv) arr.push(a);
+      return arr;
+    }
+    return [];
+  }, [selectedSet, selStartVal, selEndVal, size]);
+
+  // Ctrl+V: parse clipboard numbers (current format) and write them consecutively
+  // from the selection start via the parent.
+  const pasteAt = useCallback(async (startAddr: number) => {
+    let text = "";
+    try { text = await navigator.clipboard.readText(); } catch { return; }
+    if (!text.trim()) return;
+    const bpv = size === "8b" ? 1 : 2;
+    const mask = bpv === 1 ? 0xff : 0xffff;
+    const values: number[] = [];
+    for (const tok of text.trim().split(/[\s,;]+/)) {
+      if (!tok) continue;
+      const n = format === "hex" ? parseInt(tok, 16) : parseInt(tok, 10);
+      if (Number.isFinite(n)) values.push(Math.max(0, Math.min(mask, n)));
+    }
+    if (values.length > 0) onValuesPaste?.(startAddr, values);
+  }, [size, format, onValuesPaste]);
+
+  // Commit the "Values per row" field (clamped 1..MAX).
+  const applyColInput = useCallback(() => {
+    const n = Math.round(Number(colInput));
+    const clamped = Number.isFinite(n) && n > 0 ? Math.min(MAX_VALUES_PER_ROW, n) : valuesPerRow;
+    setColumns(clamped);
+    setColInput(String(clamped));
+  }, [colInput, valuesPerRow, setColumns]);
   // Minimap (remplace la scrollbar) : canvas plein fichier + indicateur de
   // viewport piloté en style direct (aucun re-render au scroll)
   const minimapRef = useRef<HTMLDivElement>(null);
@@ -371,6 +687,138 @@ export function HexdumpViewer({
 
   // Safely get file data length (handle undefined/null)
   const safeFileData = useMemo(() => fileData || [], [fileData]);
+
+  // Ctrl+C: copy the selected values to the clipboard as space-separated numbers
+  // in the current Hex/Dec format (16-bit values honour the byte order).
+  const copySelection = useCallback(async (addrs: number[]) => {
+    const bpv = size === "8b" ? 1 : 2;
+    const mask = bpv === 1 ? 0xff : 0xffff;
+    const parts = addrs.map((a) => {
+      const v = bpv === 1 ? (safeFileData[a] ?? 0) : read16(safeFileData, a, byteOrder);
+      return format === "hex" ? (v & mask).toString(16).toUpperCase() : String(v & mask);
+    });
+    try { await navigator.clipboard.writeText(parts.join(" ")); } catch { /* clipboard blocked */ }
+  }, [safeFileData, size, byteOrder, format]);
+
+  // Inline editing handlers (need safeFileData).
+  const beginEdit = useCallback((byteOffset: number) => {
+    const bpv = size === "8b" ? 1 : 2;
+    const v = bpv === 1
+      ? (safeFileData[byteOffset] ?? 0)
+      : read16(safeFileData, byteOffset, byteOrder);
+    committingRef.current = false;
+    setEditDraft(format === "hex" ? v.toString(16).toUpperCase() : v.toString(10));
+    setEditingByteOffset(byteOffset);
+  }, [safeFileData, size, byteOrder, format]);
+  const commitEdit = useCallback(() => {
+    if (editingByteOffset === null || committingRef.current) return;
+    committingRef.current = true;
+    const parsed = format === "hex" ? parseInt(editDraft.trim(), 16) : parseInt(editDraft.trim(), 10);
+    if (Number.isFinite(parsed)) {
+      const max = size === "8b" ? 0xff : 0xffff;
+      const val = Math.max(0, Math.min(max, parsed));
+      if (editIsBulk && bulkAddrsRef.current && onValuesFill) {
+        // Apply the typed value to every selected value at once.
+        onValuesFill(bulkAddrsRef.current, val);
+      } else if (onValueEdit) {
+        onValueEdit(editingByteOffset, val);
+      }
+    }
+    setEditIsBulk(false);
+    bulkAddrsRef.current = null;
+    setEditingByteOffset(null);
+  }, [editingByteOffset, editDraft, format, size, onValueEdit, onValuesFill, editIsBulk]);
+  // Begin a bulk edit: an input opens on the FIRST selected cell (prefilled with
+  // its current value); committing writes the value to every selected value.
+  const startBulkEdit = useCallback(() => {
+    const addrs = getSelectedAddrs();
+    if (addrs.length === 0) return;
+    const first = addrs[0];
+    const bpv = size === "8b" ? 1 : 2;
+    const v = bpv === 1
+      ? (safeFileData[first] ?? 0)
+      : read16(safeFileData, first, byteOrder);
+    committingRef.current = false;
+    bulkAddrsRef.current = addrs;
+    setEditIsBulk(true);
+    setEditDraft(format === "hex" ? v.toString(16).toUpperCase() : v.toString(10));
+    setEditingByteOffset(first);
+  }, [getSelectedAddrs, size, byteOrder, format, safeFileData]);
+  const cancelEdit = useCallback(() => {
+    setEditIsBulk(false);
+    bulkAddrsRef.current = null;
+    committingRef.current = true;
+    setEditingByteOffset(null);
+  }, []);
+
+  // ENTER, with one or more values selected, opens an editor that applies the
+  // typed value to EVERY selected value. Scoped so it never hijacks typing in a
+  // real input, and only when bulk editing is possible (modified view, handler
+  // present, nothing already being edited).
+  useEffect(() => {
+    if (displayMode !== "modified" || selectMode || !onValuesFill) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Enter") return;
+      if (selStartVal === null || selEndVal === null) return;
+      if (editingByteOffset !== null) return;
+      const ae = document.activeElement as HTMLElement | null;
+      // Never hijack typing in a real field, or Enter on a focused control that
+      // isn't part of the hexdump (a button, a map window, etc.). After a
+      // drag-select nothing is focused, so activeElement is the body.
+      if (ae && (ae.tagName === "INPUT" || ae.tagName === "TEXTAREA" || ae.isContentEditable)) return;
+      if (ae && ae !== document.body && !scrollContentRef.current?.contains(ae)) return;
+      e.preventDefault();
+      startBulkEdit();
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [displayMode, selectMode, onValuesFill, selStartVal, selEndVal, editingByteOffset, startBulkEdit]);
+
+  // F11 restores every selected value to the original file's bytes. Same scoping
+  // as the ENTER bulk-edit handler; preventDefault also stops the browser/webview
+  // from toggling fullscreen.
+  useEffect(() => {
+    if (displayMode !== "modified" || selectMode || !onValuesRestore) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "F11") return;
+      if (editingByteOffset !== null) return;
+      const ae = document.activeElement as HTMLElement | null;
+      if (ae && (ae.tagName === "INPUT" || ae.tagName === "TEXTAREA" || ae.isContentEditable)) return;
+      if (ae && ae !== document.body && !scrollContentRef.current?.contains(ae)) return;
+      const addrs = getSelectedAddrs();
+      if (addrs.length === 0) return;
+      e.preventDefault();
+      onValuesRestore(addrs);
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [displayMode, selectMode, onValuesRestore, editingByteOffset, getSelectedAddrs]);
+
+  // + / - (or = for +): add / subtract the toolbar step from every selected
+  // value. Same scoping as ENTER/F11; ignores Ctrl/Meta/Alt so it never clashes
+  // with the Ctrl+/- zoom or Ctrl+arrow align.
+  useEffect(() => {
+    // Works in Mod and % views (in % view the step is a percent of each value).
+    if (displayMode === "original" || selectMode || !onValuesAdjust) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      if (editingByteOffset !== null) return;
+      let sign: 1 | -1 | 0 = 0;
+      if (e.key === "+" || e.key === "=") sign = 1;
+      else if (e.key === "-" || e.key === "_") sign = -1;
+      if (sign === 0) return;
+      const ae = document.activeElement as HTMLElement | null;
+      if (ae && (ae.tagName === "INPUT" || ae.tagName === "TEXTAREA" || ae.isContentEditable)) return;
+      if (ae && ae !== document.body && !scrollContentRef.current?.contains(ae)) return;
+      const addrs = getSelectedAddrs();
+      if (addrs.length === 0) return;
+      e.preventDefault();
+      onValuesAdjust(addrs, sign);
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [displayMode, selectMode, onValuesAdjust, editingByteOffset, getSelectedAddrs]);
+
   const fileDataLength = safeFileData.length;
 
   // Calculate bytes per row based on size.
@@ -378,13 +826,24 @@ export function HexdumpViewer({
   // 16 fixe en mode 8b (8 valeurs de 1 octet, adresses au pas de 16) cachait
   // UN OCTET SUR DEUX — les modifications tombant dans la moitié invisible
   // semblaient ne jamais apparaître.
-  const { bytesPerValue, valuesPerRow, bytesPerRow, totalRows } = useMemo(() => {
+  const { bytesPerValue, bytesPerRow, totalRows } = useMemo(() => {
     const bytesPerValue = size === "8b" ? 1 : 2;
-    const valuesPerRow = 8;
-    const bytesPerRow = valuesPerRow * bytesPerValue; // 8b: 8, 16b: 16
-    const totalRows = Math.ceil(fileDataLength / bytesPerRow);
-    return { bytesPerValue, valuesPerRow, bytesPerRow, totalRows };
-  }, [size, fileDataLength]);
+    const bytesPerRow = valuesPerRow * bytesPerValue;
+    // The alignment shift adds up to one extra row at the end for the bytes
+    // pushed past the last row boundary.
+    const totalRows = Math.ceil((fileDataLength + alignOffset) / bytesPerRow);
+    return { bytesPerValue, bytesPerRow, totalRows };
+  }, [size, fileDataLength, valuesPerRow, alignOffset]);
+
+  // Keep the alignment shift valid (< bytesPerRow, value-aligned) when the word
+  // size or columns change.
+  useEffect(() => {
+    setAlignOffset((o) => {
+      const bpv = size === "8b" ? 1 : 2;
+      const m = ((o % bytesPerRow) + bytesPerRow) % bytesPerRow;
+      return m - (m % bpv); // snap to a whole value
+    });
+  }, [bytesPerRow, size]);
 
   // Create a map of byte address -> map info for quick lookup
   const byteToMapInfo = useMemo(() => {
@@ -430,6 +889,97 @@ export function HexdumpViewer({
     return { entries, above, below };
   }, [safeFileData, safeOriginalData, fileDataLength, size, byteOrder]);
 
+  // Report the changed-byte addresses to the parent (drives the toolbar's
+  // change navigator). Fires only when the set actually changes.
+  const lastDiffKey = useRef<string>("");
+  useEffect(() => {
+    if (!onDiffAddressesChange) return;
+    const addrs = diffInfo.entries.map((e) => e.addr);
+    const key = `${addrs.length}:${addrs[0] ?? -1}:${addrs[addrs.length - 1] ?? -1}`;
+    if (key === lastDiffKey.current) return;
+    lastDiffKey.current = key;
+    onDiffAddressesChange(addrs);
+  }, [diffInfo, onDiffAddressesChange]);
+
+  // Shift+Alt+D: select the modified/different values that are currently VISIBLE
+  // (the rows on screen, not the whole file). Builds a discontiguous selection.
+  const selectVisibleDiffs = useCallback(() => {
+    const sc = scrollContentRef.current;
+    if (!sc) return;
+    const firstRow = Math.floor(sc.scrollTop / ROW_HEIGHT);
+    const lastRow = Math.ceil((sc.scrollTop + sc.clientHeight) / ROW_HEIGHT);
+    // Map the visible rows to real file addresses through the alignment shift.
+    const startAddr = firstRow * bytesPerRow - alignOffset;
+    const endAddr = lastRow * bytesPerRow - alignOffset;
+    const set = new Set<number>();
+    let min = Infinity;
+    let max = -Infinity;
+    for (const e of diffInfo.entries) {
+      if (e.addr >= startAddr && e.addr < endAddr) {
+        set.add(e.addr);
+        if (e.addr < min) min = e.addr;
+        if (e.addr > max) max = e.addr;
+      }
+    }
+    if (set.size === 0) { clearSelection(); return; }
+    setSelectedSet(set);
+    setSelAnchor(min); // extent, so selStartVal/onSelectionStartChange stay valid
+    setSelFocus(max);
+  }, [diffInfo, bytesPerRow, alignOffset, clearSelection]);
+
+  // Ctrl+C copy, Ctrl+V paste, Shift+Alt+D select-visible-diffs. Scoped to the
+  // hexdump and skipped while a real input is focused (so it keeps its own copy/
+  // paste/typing).
+  useEffect(() => {
+    const isField = (ae: Element | null) =>
+      !!ae && (ae.tagName === "INPUT" || ae.tagName === "TEXTAREA" || (ae as HTMLElement).isContentEditable);
+    const inScope = (ae: Element | null) => !ae || ae === document.body || !!scrollContentRef.current?.contains(ae);
+    const onKey = (e: KeyboardEvent) => {
+      const ae = document.activeElement;
+      if (e.altKey && e.shiftKey && !e.ctrlKey && !e.metaKey && e.code === "KeyD") {
+        if (displayMode !== "modified" || isField(ae) || !inScope(ae)) return;
+        e.preventDefault();
+        selectVisibleDiffs();
+        return;
+      }
+      if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
+      if (isField(ae) || !inScope(ae)) return; // let inputs do their own copy/paste
+      const k = e.key.toLowerCase();
+      if (k === "c") {
+        const addrs = getSelectedAddrs();
+        if (addrs.length === 0) return;
+        e.preventDefault();
+        copySelection(addrs);
+      } else if (k === "v") {
+        if (displayMode !== "modified" || !onValuesPaste) return;
+        const addrs = getSelectedAddrs();
+        if (addrs.length === 0) return;
+        e.preventDefault();
+        pasteAt(addrs[0]);
+      }
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [displayMode, getSelectedAddrs, copySelection, pasteAt, selectVisibleDiffs, onValuesPaste]);
+
+  // Ctrl+← / Ctrl+→ nudge the whole value grid one column left/right (view-only,
+  // cyclic within a row) so a map's values can be aligned to a column boundary.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey) return;
+      if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+      const ae = document.activeElement as HTMLElement | null;
+      if (ae && (ae.tagName === "INPUT" || ae.tagName === "TEXTAREA" || ae.isContentEditable)) return;
+      if (ae && ae !== document.body && !scrollContentRef.current?.contains(ae)) return;
+      e.preventDefault();
+      const bpv = size === "8b" ? 1 : 2;
+      const delta = e.key === "ArrowRight" ? bpv : -bpv;
+      setAlignOffset((o) => (((o + delta) % bytesPerRow) + bytesPerRow) % bytesPerRow);
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [size, bytesPerRow]);
+
   // Create a map of byte address -> search result info for quick lookup
   const byteToSearchInfo = useMemo(() => {
     const map = new Map<number, ByteSearchInfo>();
@@ -449,24 +999,37 @@ export function HexdumpViewer({
     return map;
   }, [searchResults, currentSearchIndex, searchDataSize]);
 
-  // Scroll to selected map/search result when it changes - centers the target row vertically
+  // Scroll to selected map/search result when it changes - centers the target row.
+  // Deduped by an "address:scrollKey" signature so the scroll fires exactly ONCE
+  // per navigation request. Without this the effect re-ran on every unrelated
+  // re-render (its onScrollComplete dep is a fresh closure each render, and a
+  // change-nav leaves selectedMapAddress set), so scrolling the minimap kept
+  // snapping the view back to the last toggled difference.
+  const lastScrollSig = useRef<string>("");
   useEffect(() => {
-    if (selectedMapAddress !== null && scrollContentRef.current) {
-      const rowIndex = Math.floor(selectedMapAddress / bytesPerRow);
-      // Center the target row in the middle of the visible area
-      const visibleHeight = scrollContentRef.current.clientHeight;
-      const scrollTop = rowIndex * ROW_HEIGHT - visibleHeight / 2 + ROW_HEIGHT / 2;
-      scrollContentRef.current.scrollTo({ top: Math.max(0, scrollTop), behavior: 'smooth' });
-
-      // Notify parent that scroll is complete (after animation)
-      // Only call if scrollKey is 0 (not a search navigation)
-      if (onScrollComplete && scrollKey === 0) {
-        setTimeout(() => {
-          onScrollComplete();
-        }, 500); // Wait for smooth scroll animation to complete
-      }
+    if (selectedMapAddress === null || !scrollContentRef.current) {
+      // Reset so re-selecting the SAME address later still triggers a scroll.
+      if (selectedMapAddress === null) lastScrollSig.current = "";
+      return;
     }
-  }, [selectedMapAddress, bytesPerRow, onScrollComplete, scrollKey]);
+    const sig = `${selectedMapAddress}:${scrollKey}`;
+    if (sig === lastScrollSig.current) return;
+    lastScrollSig.current = sig;
+
+    // Account for the alignment shift when locating the target's row.
+    const rowIndex = Math.floor((selectedMapAddress + alignOffset) / bytesPerRow);
+    const visibleHeight = scrollContentRef.current.clientHeight;
+    const scrollTop = rowIndex * ROW_HEIGHT - visibleHeight / 2 + ROW_HEIGHT / 2;
+    scrollContentRef.current.scrollTo({ top: Math.max(0, scrollTop), behavior: 'smooth' });
+
+    // Notify parent that scroll is complete (after animation). Only for a map/
+    // search click (scrollKey 0); change-nav keeps its target set.
+    if (onScrollComplete && scrollKey === 0) {
+      setTimeout(() => {
+        onScrollComplete();
+      }, 500); // Wait for smooth scroll animation to complete
+    }
+  }, [selectedMapAddress, bytesPerRow, onScrollComplete, scrollKey, alignOffset]);
 
   useEffect(() => {
     const container = scrollContentRef.current;
@@ -478,6 +1041,11 @@ export function HexdumpViewer({
     let ticking = false;
     const updateRange = () => {
       ticking = false;
+      // Keep the offset-column header aligned when rows are wider than the
+      // viewport and scroll horizontally.
+      if (headerColsRef.current) {
+        headerColsRef.current.style.transform = `translateX(${-container.scrollLeft}px)`;
+      }
       const scrollTop = container.scrollTop;
       const containerHeight = container.clientHeight;
 
@@ -515,6 +1083,17 @@ export function HexdumpViewer({
 
     return () => container.removeEventListener('scroll', handleScroll);
   }, [totalRows, size, format]);
+
+  // Report the grid's needed width so the host window can grow to fit when the
+  // columns count (or word size) changes. Measured after layout settles.
+  useEffect(() => {
+    if (!onContentWidthChange) return;
+    const id = requestAnimationFrame(() => {
+      const el = scrollContentRef.current;
+      if (el) onContentWidthChange(el.scrollWidth + MINIMAP_WIDTH + 24); // + minimap + chrome
+    });
+    return () => cancelAnimationFrame(id);
+  }, [valuesPerRow, size, format, fileDataLength, onContentWidthChange]);
 
   // --- Minimap : mesure du conteneur (hauteur = zone scrollable) ---
   useEffect(() => {
@@ -645,6 +1224,9 @@ export function HexdumpViewer({
   }, [totalRows]);
 
   const handleByteClick = useCallback((byteAddress: number) => {
+    // A drag just selected a range — swallow the trailing click so it doesn't
+    // also open a map. A plain click (no drag) still opens the map underneath.
+    if (draggedRef.current) { draggedRef.current = false; return; }
     const mapInfo = byteToMapInfo.get(byteAddress);
     if (mapInfo && onMapClick) {
       onMapClick(mapInfo.mapRegion);
@@ -686,6 +1268,8 @@ export function HexdumpViewer({
       ref={containerRef}
       className={`h-full bg-transparent flex ${theme === 'light' ? 'light-theme' : ''}`}
       style={{ width: containerWidth, minWidth, marginBottom: '16px', height: 'calc(100% - 16px)' }}
+      onMouseEnter={() => { hoverRef.current = true; }}
+      onMouseLeave={() => { hoverRef.current = false; }}
     >
       {/* Main content area */}
       <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
@@ -703,19 +1287,93 @@ export function HexdumpViewer({
                 </span>
               )}
             </div>
-            {onSearchClick && (
-              <button
-                onClick={onSearchClick}
-                className="text-[11px] px-3 py-1 rounded font-medium transition-colors duration-200 hover:bg-yellow-500/50"
-                style={{
-                  color: theme === 'light' ? '#000000' : '#ffffff',
-                  background: theme === 'light' ? 'rgba(0, 0, 0, 0.05)' : 'rgba(255, 255, 255, 0.06)',
-                  border: `1px solid ${theme === 'light' ? 'rgba(0, 0, 0, 0.12)' : 'rgba(255, 255, 255, 0.12)'}`,
-                }}
-              >
-                {searchButtonLabel}
-              </button>
-            )}
+            <div className="flex items-center gap-1.5 flex-shrink-0">
+              {/* Values per row — line up a full map row, or narrow the grid. */}
+              <div className="flex items-center gap-1" title="Values per row (1–512) — W narrower, M wider">
+                <span className="text-[10px]" style={{ color: getHeaderTextColor() }}>Cols</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={MAX_VALUES_PER_ROW}
+                  value={colInput}
+                  onChange={(e) => setColInput(e.target.value)}
+                  onBlur={() => applyColInput()}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') { e.preventDefault(); applyColInput(); (e.target as HTMLInputElement).blur(); }
+                    else if (e.key === 'Escape') { setColInput(String(valuesPerRow)); (e.target as HTMLInputElement).blur(); }
+                    e.stopPropagation();
+                  }}
+                  className="w-12 text-center font-mono text-[11px] rounded outline-none"
+                  style={{
+                    background: theme === 'light' ? '#fff' : 'rgba(255,255,255,0.06)',
+                    color: theme === 'light' ? '#000' : '#fff',
+                    border: `1px solid ${theme === 'light' ? 'rgba(0,0,0,0.12)' : 'rgba(255,255,255,0.12)'}`,
+                    padding: '2px 4px',
+                  }}
+                />
+              </div>
+              {alignOffset !== 0 && (
+                <button
+                  onClick={() => setAlignOffset(0)}
+                  title="Grid shifted for alignment (Ctrl+←/→) — click to reset"
+                  className="text-[10px] px-1.5 py-0.5 rounded font-mono"
+                  style={{
+                    color: theme === 'light' ? '#b45309' : '#fbbf24',
+                    background: theme === 'light' ? 'rgba(245,158,11,0.12)' : 'rgba(245,158,11,0.18)',
+                    border: '1px solid rgba(245,158,11,0.45)',
+                  }}
+                >
+                  ⇄ +{alignOffset}
+                </button>
+              )}
+              {selectMode && selByteCount === 0 && (
+                <span className="text-[10px]" style={{ color: getHeaderTextColor() }}>Drag to select</span>
+              )}
+              {onCreateMapFromSelection && selectMode && selByteCount > 0 && (
+                <button
+                  onClick={() => {
+                    if (selStartVal !== null) onCreateMapFromSelection(selStartVal, selByteCount);
+                    clearSelection();
+                    setSelectMode(false);
+                  }}
+                  className="text-[11px] px-3 py-1 rounded font-medium transition-colors"
+                  style={{
+                    color: '#ffffff',
+                    background: 'linear-gradient(90deg, rgba(220,38,38,0.9), rgba(249,115,22,0.9))',
+                    border: '1px solid rgba(255,255,255,0.15)',
+                  }}
+                >
+                  {createMapLabel} ({selByteCount} B)
+                </button>
+              )}
+              {onCreateMapFromSelection && (
+                <button
+                  onClick={() => { setSelectMode((m) => !m); clearSelection(); }}
+                  className="text-[11px] px-3 py-1 rounded font-medium transition-colors"
+                  style={{
+                    color: selectMode ? '#ffffff' : (theme === 'light' ? '#000000' : '#ffffff'),
+                    background: selectMode ? 'rgba(47,95,176,0.85)' : (theme === 'light' ? 'rgba(0, 0, 0, 0.05)' : 'rgba(255, 255, 255, 0.06)'),
+                    border: `1px solid ${theme === 'light' ? 'rgba(0, 0, 0, 0.12)' : 'rgba(255, 255, 255, 0.12)'}`,
+                  }}
+                  title={selectMode ? 'Cancel selection' : 'Select bytes to create a map'}
+                >
+                  {selectMode ? 'Cancel' : createMapLabel}
+                </button>
+              )}
+              {onSearchClick && (
+                <button
+                  onClick={onSearchClick}
+                  className="text-[11px] px-3 py-1 rounded font-medium transition-colors duration-200 hover:bg-yellow-500/50"
+                  style={{
+                    color: theme === 'light' ? '#000000' : '#ffffff',
+                    background: theme === 'light' ? 'rgba(0, 0, 0, 0.05)' : 'rgba(255, 255, 255, 0.06)',
+                    border: `1px solid ${theme === 'light' ? 'rgba(0, 0, 0, 0.12)' : 'rgba(255, 255, 255, 0.12)'}`,
+                  }}
+                >
+                  {searchButtonLabel}
+                </button>
+              )}
+            </div>
           </div>
 
         </div>
@@ -723,10 +1381,10 @@ export function HexdumpViewer({
         {/* Offset column header (aligné sur la grille des valeurs) */}
         <div
           className="flex gap-3 font-mono text-[10px] px-3 pb-1 select-none flex-shrink-0"
-          style={{ color: getHeaderTextColor() }}
+          style={{ color: getHeaderTextColor(), overflow: 'hidden' }}
         >
           <div className="flex-shrink-0 font-semibold" style={{ width: '3rem' }}>Offset</div>
-          <div className="flex flex-shrink-0">
+          <div className="flex flex-shrink-0" ref={headerColsRef} style={{ willChange: 'transform' }}>
             {Array.from({ length: valuesPerRow }, (_, j) => (
               <div
                 key={j}
@@ -743,7 +1401,8 @@ export function HexdumpViewer({
         <div className="flex-1 flex min-h-0">
         <div
           ref={scrollContentRef}
-          className={`flex-1 overflow-auto px-3 pb-3 hexdump-noscrollbar ${theme === 'light' ? 'light-theme' : ''}`}
+          tabIndex={-1}
+          className={`flex-1 overflow-auto px-3 pb-3 hexdump-noscrollbar outline-none ${theme === 'light' ? 'light-theme' : ''}`}
         >
           {/* Virtualized content */}
           <div
@@ -777,13 +1436,41 @@ export function HexdumpViewer({
                   bytesPerValue={bytesPerValue}
                   valuesPerRow={valuesPerRow}
                   bytesPerRow={bytesPerRow}
+                  displayMode={displayMode}
                   byteToMapInfo={byteToMapInfo}
                   byteToSearchInfo={byteToSearchInfo}
                   hoveredMap={rowHoveredMap}
+                  selectMode={selectMode}
+                  selStartVal={selStartVal}
+                  selEndVal={selEndVal}
+                  selectedSet={selectedSet}
+                  alignOffset={alignOffset}
+                  currentChangeAddress={currentChangeAddress}
                   onByteClick={handleByteClick}
                   onByteHover={handleByteHover}
                   onLabelClick={handleLabelClick}
                   onLabelHover={handleLabelHover}
+                  onCellSelectDown={onCellSelectDown}
+                  onCellSelectEnter={onCellSelectEnter}
+                  editable={editable}
+                  editingByteOffset={
+                    editingByteOffset !== null &&
+                    editingByteOffset >= rowIndex * bytesPerRow &&
+                    editingByteOffset < (rowIndex + 1) * bytesPerRow
+                      ? editingByteOffset
+                      : -1
+                  }
+                  editDraft={
+                    editingByteOffset !== null &&
+                    editingByteOffset >= rowIndex * bytesPerRow &&
+                    editingByteOffset < (rowIndex + 1) * bytesPerRow
+                      ? editDraft
+                      : ''
+                  }
+                  onEditStart={beginEdit}
+                  onEditChange={setEditDraft}
+                  onEditCommit={commitEdit}
+                  onEditCancel={cancelEdit}
                 />
               );
             })}

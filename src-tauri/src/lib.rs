@@ -41,6 +41,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::identify_ecu,
             commands::detect_maps,
+            commands::scan_potential_maps,
             commands::detector_version,
             commands::list_ecus,
             commands::save_binary_file,

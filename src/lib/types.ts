@@ -32,8 +32,19 @@ export interface FileRecord {
   map_display_settings?: any;
   /** Tri de la liste des maps choisi par l'utilisateur (mémorisé avec le projet) */
   map_sort_mode?: "address" | "name" | "name-desc";
+  /** Per-project hexdump view preferences, restored when the project reopens. */
+  hexdump_settings?: HexdumpSettings;
   created: string;
   updated: string;
+}
+
+export interface HexdumpSettings {
+  size?: "8b" | "16b";
+  format?: "hex" | "dec";
+  byteOrder?: "hilo" | "lohi";
+  displayMode?: "modified" | "original" | "percent";
+  columns?: number;
+  zoom?: number;
 }
 
 export interface Version {

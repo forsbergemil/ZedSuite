@@ -184,29 +184,41 @@ impl ECUIdentifier {
         Self::identify_by_heuristics(data)
     }
     
-    /// Negative gate: identify newer Bosch families that are NOT supported
-    /// but share the EDC16's ASCII metadata (0281 HW numbers, 1037 SW
-    /// numbers, VAG part numbers) and dump sizes. Without this check a 2MB
-    /// EDC17 dump would sail through the EDC16 heuristics.
-    /// The family strings ("EDC17C46", "MED17.5", ...) are present in every
+    /// Identify newer Bosch families that share the EDC16's ASCII metadata
+    /// (0281 HW numbers, 1037 SW numbers, VAG part numbers) and dump sizes.
+    /// Without this a 2MB EDC17 dump would sail through the EDC16 heuristics.
+    /// The family strings ("EDC17_C50_C56", "MED17.5", ...) are present in every
     /// firmware of these families and never appear in EDC15/EDC16 dumps.
+    ///
+    /// EDC17 is recognized as a BETA family: there is no dedicated EDC17
+    /// detector, so its maps come from the generic potential-maps scanner, but
+    /// the identification itself is solid. We pull the exact family token out of
+    /// the metadata block (e.g. "EDC17_C50_C56") for display. MED17 stays
+    /// unsupported (no beta scan target requested).
     fn identify_unsupported_bosch(data: &[u8]) -> Option<ECUIdentification> {
-        let families: [(&[u8], ECUType, &str); 2] = [
-            (b"EDC17", ECUType::EDC17C, "EDC17 (not supported)"),
-            (b"MED17", ECUType::MED17_1, "MED17 (not supported)"),
-        ];
-        for (needle, ecu_type, variant) in families {
-            if Self::contains_sequence(data, needle) {
-                return Some(ECUIdentification {
-                    manufacturer: ECUManufacturer::Bosch,
-                    ecu_type,
-                    variant: Some(variant.to_string()),
-                    software_version: None,
-                    hardware_version: None,
-                    part_number: None,
-                    confidence: 0.85,
-                });
-            }
+        if let Some(pos) = Self::find_sequence(data, b"EDC17") {
+            let variant =
+                Self::extract_ascii_token(data, pos, 24).unwrap_or_else(|| "EDC17".to_string());
+            return Some(ECUIdentification {
+                manufacturer: ECUManufacturer::Bosch,
+                ecu_type: ECUType::EDC17C,
+                variant: Some(variant),
+                software_version: None,
+                hardware_version: None,
+                part_number: None,
+                confidence: 0.85,
+            });
+        }
+        if Self::contains_sequence(data, b"MED17") {
+            return Some(ECUIdentification {
+                manufacturer: ECUManufacturer::Bosch,
+                ecu_type: ECUType::MED17_1,
+                variant: Some("MED17 (not supported)".to_string()),
+                software_version: None,
+                hardware_version: None,
+                part_number: None,
+                confidence: 0.85,
+            });
         }
         None
     }
@@ -1216,6 +1228,28 @@ impl ECUIdentifier {
     fn contains_sequence(data: &[u8], pattern: &[u8]) -> bool {
         data.windows(pattern.len()).any(|window| window == pattern)
     }
+
+    /// First index of `pattern` in `data`, if present.
+    fn find_sequence(data: &[u8], pattern: &[u8]) -> Option<usize> {
+        data.windows(pattern.len()).position(|window| window == pattern)
+    }
+
+    /// Read an ASCII token (letters, digits, '_') starting at `start`, up to
+    /// `max` bytes — used to pull a family string like "EDC17_C50_C56" out of
+    /// the metadata block, stopping at the first separator ('/', space, ...).
+    fn extract_ascii_token(data: &[u8], start: usize, max: usize) -> Option<String> {
+        let end = std::cmp::min(start + max, data.len());
+        let token: String = data[start..end]
+            .iter()
+            .take_while(|&&b| b.is_ascii_alphanumeric() || b == b'_')
+            .map(|&b| b as char)
+            .collect();
+        if token.len() >= 5 {
+            Some(token)
+        } else {
+            None
+        }
+    }
     
     fn contains_hex_pattern(data: &[u8], pattern: &[u8]) -> bool {
         Self::contains_sequence(data, pattern)
@@ -1722,6 +1756,8 @@ mod tests {
         assert_ne!(id.ecu_type, ECUType::EDC16U34);
         assert_ne!(id.ecu_type, ECUType::EDC16U31);
         assert_eq!(id.ecu_type, ECUType::EDC17C);
+        // Beta EDC17: the family token is pulled from the metadata for display.
+        assert_eq!(id.variant.as_deref(), Some("EDC17C46"));
     }
 
     #[test]

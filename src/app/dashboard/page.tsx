@@ -8,6 +8,7 @@ import * as store from "@/lib/local/store";
 import { Button } from "@/components/ui/button";
 import { StyledSelect } from "@/components/styled-select";
 import { MODAL_GLASS, MODAL_GLASS_LIGHT } from "@/lib/modal-glass";
+import { CAR_BRANDS } from "@/lib/car-brands";
 import { useToast } from "@/hooks/use-toast";
 import { ProjectCreator } from "@/components/project-creator";
 import { WindowControls } from "@/components/window-controls";
@@ -135,7 +136,7 @@ function ProjectInfoEditModal({
     });
   };
 
-  const brands = ["Audi", "Seat", "Skoda", "Volkswagen"];
+  const brands = CAR_BRANDS;
   const stages = ["Stage 1", "Stage 2", "Stage 3"];
   const transmissions = ["Automatic", "Manual"];
   const years = Array.from({ length: new Date().getFullYear() - 1996 }, (_, i) => new Date().getFullYear() - i);

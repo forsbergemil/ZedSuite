@@ -100,15 +100,37 @@ async function saveFileRecord(record: FileRecord): Promise<void> {
   );
 }
 
+// Serialize the read-modify-write of each project.json: independent updateFile
+// calls (e.g. saving detection_data and map_display_settings at the same time)
+// must not race, or the second — reading a stale record — clobbers the first's
+// field. One promise chain per fileId keeps them in order.
+const fileWriteQueues = new Map<string, Promise<unknown>>();
+
 export async function updateFile(
   fileId: string,
   patch: Partial<FileRecord>
 ): Promise<FileRecord | null> {
-  const record = await getFile(fileId);
-  if (!record) return null;
-  Object.assign(record, patch, { id: record.id, created: record.created });
-  await saveFileRecord(record);
-  return record;
+  const previous = fileWriteQueues.get(fileId) ?? Promise.resolve();
+  let result: FileRecord | null = null;
+  const run = previous
+    .catch(() => undefined)
+    .then(async () => {
+      const record = await getFile(fileId);
+      if (!record) {
+        result = null;
+        return;
+      }
+      Object.assign(record, patch, { id: record.id, created: record.created });
+      await saveFileRecord(record);
+      result = record;
+    });
+  fileWriteQueues.set(fileId, run);
+  try {
+    await run;
+  } finally {
+    if (fileWriteQueues.get(fileId) === run) fileWriteQueues.delete(fileId);
+  }
+  return result;
 }
 
 export async function deleteFile(fileId: string): Promise<boolean> {
@@ -460,6 +482,74 @@ export async function replaceMapEdits(
     if (mapEditQueues.get(versionId) === run) mapEditQueues.delete(versionId);
   }
   return result;
+}
+
+// ── Custom solutions ──────────────────────────────────────────────
+// User-made solutions extracted from a file version (its byte diff vs the
+// original), stored GLOBALLY so they can be applied to other projects. One
+// JSON file at the app-data root, independent of any project.
+
+export interface CustomSolutionPatch {
+  address: number; // absolute address in the SOURCE file it was made from
+  data: number[]; // new bytes to write
+  /**
+   * The bytes this patch replaced in the source original. Used to relocate the
+   * solution in a target file of a different size/base (search + verify) and to
+   * avoid writing over a region that does not match. Optional for solutions
+   * saved before relocation existed.
+   */
+  original?: number[];
+}
+
+export interface CustomSolution {
+  id: string;
+  name: string;
+  description?: string;
+  /** ECU type of the file it was made from (informational — apply with care). */
+  ecuType?: string;
+  createdAt: string;
+  patches: CustomSolutionPatch[];
+  /** Total number of bytes the solution changes. */
+  byteCount: number;
+  /**
+   * A window of source-original bytes (with its source address) around the
+   * first patch. Applying searches the target for this signature to compute a
+   * global offset, so a solution made from a partial dump can be applied to a
+   * full dump of the same calibration.
+   */
+  signature?: { address: number; bytes: number[] };
+}
+
+const CUSTOM_SOLUTIONS_FILE = "custom-solutions.json";
+
+export async function listCustomSolutions(): Promise<CustomSolution[]> {
+  try {
+    const raw = await readTextFile(CUSTOM_SOLUTIONS_FILE, BASE);
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? (parsed as CustomSolution[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+async function writeCustomSolutions(list: CustomSolution[]): Promise<void> {
+  await writeTextFile(CUSTOM_SOLUTIONS_FILE, JSON.stringify(list, null, 2), BASE);
+}
+
+/** Add a solution (or replace one with the same id). Returns the new list. */
+export async function saveCustomSolution(sol: CustomSolution): Promise<CustomSolution[]> {
+  const list = await listCustomSolutions();
+  const idx = list.findIndex((s) => s.id === sol.id);
+  if (idx >= 0) list[idx] = sol;
+  else list.push(sol);
+  await writeCustomSolutions(list);
+  return list;
+}
+
+export async function deleteCustomSolution(id: string): Promise<CustomSolution[]> {
+  const list = (await listCustomSolutions()).filter((s) => s.id !== id);
+  await writeCustomSolutions(list);
+  return list;
 }
 
 async function addMapEditUnlocked(

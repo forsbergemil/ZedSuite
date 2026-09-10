@@ -5,7 +5,7 @@
 // affichée comme telle et ne peut pas être ré-appliquée.
 
 import { useState, useMemo } from "react";
-import { X, Zap, Shield, Cpu, Check, ChevronRight } from "lucide-react";
+import { X, Zap, Shield, Cpu, Check, ChevronRight, Star, Trash2, Plus } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   getSolutionsForECU,
@@ -13,6 +13,7 @@ import {
   solutionMapPatterns,
   type Solution,
 } from "@/lib/ecu/solutions";
+import type { CustomSolution } from "@/lib/local/store";
 import { useI18n } from "@/contexts/i18n-context";
 import { getModalGlassStyle } from "@/lib/modal-glass";
 
@@ -31,6 +32,11 @@ interface SolutionsModalProps {
   usedSolutions?: Record<string, string>;
   /** Cartes détectées dans le fichier (pour l'état « déjà actif ») */
   detectedMaps?: DetectedMapInfo[];
+  /** User-made solutions (global) and the machinery to make/delete them. */
+  customSolutions?: CustomSolution[];
+  versions?: { id: string; name: string }[];
+  onCreateSolutionFromVersion?: (versionId: string, name: string, description: string) => void;
+  onDeleteCustomSolution?: (id: string) => void;
 }
 
 const iconMap: Record<string, React.ComponentType<{ className?: string }>> = {
@@ -57,10 +63,21 @@ export function SolutionsModal({
   theme = "default",
   usedSolutions = {},
   detectedMaps = [],
+  customSolutions = [],
+  versions = [],
+  onCreateSolutionFromVersion,
+  onDeleteCustomSolution,
 }: SolutionsModalProps) {
   const [selectedSolutions, setSelectedSolutions] = useState<Set<string>>(new Set());
   const { t } = useI18n();
   const tr = t.solutions as any;
+
+  // "Create solution from version" panel state.
+  const nonOriVersions = useMemo(() => versions.filter((v) => v.name !== "Ori"), [versions]);
+  const [createOpen, setCreateOpen] = useState(false);
+  const [createVersionId, setCreateVersionId] = useState("");
+  const [createName, setCreateName] = useState("");
+  const [createDesc, setCreateDesc] = useState("");
 
   const getTranslatedSolution = (solution: Solution) => {
     const translated = (tr as Record<string, { name?: string; description?: string }>)[solution.id];
@@ -131,6 +148,11 @@ export function SolutionsModal({
   const getBgHover = () => (theme === "light" ? "hover:bg-black/5" : "hover:bg-white/5");
   const getBorderColor = () =>
     theme === "light" ? "rgba(0, 0, 0, 0.1)" : "rgba(255, 255, 255, 0.1)";
+  const fieldStyle: React.CSSProperties = {
+    color: getTextColor(),
+    background: theme === "light" ? "rgba(0,0,0,0.05)" : "rgba(255,255,255,0.06)",
+    border: `1px solid ${getBorderColor()}`,
+  };
 
   return (
     <div
@@ -206,17 +228,14 @@ export function SolutionsModal({
           </div>
 
           {/* Liste */}
-          <div className="p-6 overflow-y-auto max-h-[60vh] upload-scroll">
+          <div className="p-6 overflow-y-auto max-h-[60vh] upload-scroll space-y-6">
             {!ecuConfig ? (
-              <div className="text-center py-10">
-                <Cpu className="w-14 h-14 mx-auto mb-4 opacity-30" style={{ color: getTextColor() }} />
-                <p className="text-lg font-medium mb-2" style={{ color: getTextColor() }}>
-                  {tr?.noSolutionsForEcu || "No solution is available for this ECU"}
-                </p>
-                <p style={{ color: getSecondaryTextColor() }}>
-                  {tr?.noSolutionsForEcuDescription ||
-                    "Solutions currently cover Bosch EDC15P and EDC15VM."}
-                </p>
+              <div
+                className="text-sm rounded-lg p-3 border"
+                style={{ color: getSecondaryTextColor(), borderColor: getBorderColor() }}
+              >
+                {tr?.noSolutionsForEcu || "No built-in solution is available for this ECU."}{" "}
+                {tr?.customStillAvailable || "You can still create and apply your own below."}
               </div>
             ) : (
               <div className="space-y-4">
@@ -349,10 +368,150 @@ export function SolutionsModal({
                 })}
               </div>
             )}
+
+            {/* My Solutions — user-made, extracted from a file version */}
+            <div>
+              <div className="flex items-center justify-between mb-2">
+                <div className="flex items-center gap-2">
+                  <Star className="w-4 h-4 text-amber-400" />
+                  <h3 className="font-semibold" style={{ color: getTextColor() }}>
+                    {tr?.mySolutions || "My Solutions"}
+                  </h3>
+                </div>
+                {onCreateSolutionFromVersion && (
+                  <button
+                    onClick={() => setCreateOpen((o) => !o)}
+                    className={`flex items-center gap-1 text-xs px-2 py-1 rounded-md ${getBgHover()}`}
+                    style={{ color: getSecondaryTextColor(), border: `1px solid ${getBorderColor()}` }}
+                  >
+                    <Plus className="w-3.5 h-3.5" /> {tr?.newFromVersion || "New from version"}
+                  </button>
+                )}
+              </div>
+
+              {createOpen && onCreateSolutionFromVersion && (
+                <div className="rounded-lg border p-3 mb-3 space-y-2" style={{ borderColor: getBorderColor() }}>
+                  {nonOriVersions.length === 0 ? (
+                    <p className="text-xs" style={{ color: getSecondaryTextColor() }}>
+                      {tr?.noVersionsToSave || "Create a version (edit the file) first, then save it as a solution."}
+                    </p>
+                  ) : (
+                    <>
+                      <select
+                        value={createVersionId}
+                        onChange={(e) => setCreateVersionId(e.target.value)}
+                        className="w-full px-2 py-1.5 rounded text-sm focus:outline-none"
+                        style={fieldStyle}
+                      >
+                        <option value="">{tr?.chooseVersion || "Choose a version…"}</option>
+                        {nonOriVersions.map((v) => (
+                          <option key={v.id} value={v.id}>{v.name}</option>
+                        ))}
+                      </select>
+                      <input
+                        value={createName}
+                        onChange={(e) => setCreateName(e.target.value)}
+                        placeholder={tr?.solutionName || "Solution name"}
+                        spellCheck={false}
+                        className="w-full px-2 py-1.5 rounded text-sm focus:outline-none"
+                        style={fieldStyle}
+                      />
+                      <input
+                        value={createDesc}
+                        onChange={(e) => setCreateDesc(e.target.value)}
+                        placeholder={tr?.solutionDesc || "Description (optional)"}
+                        spellCheck={false}
+                        className="w-full px-2 py-1.5 rounded text-sm focus:outline-none"
+                        style={fieldStyle}
+                      />
+                      <div className="flex justify-end">
+                        <Button
+                          disabled={!createVersionId}
+                          onClick={() => {
+                            onCreateSolutionFromVersion(createVersionId, createName, createDesc);
+                            setCreateName("");
+                            setCreateDesc("");
+                            setCreateVersionId("");
+                            setCreateOpen(false);
+                          }}
+                          className="px-4 bg-gradient-to-r from-red-600 via-red-500 to-orange-500 text-white disabled:opacity-50"
+                        >
+                          {tr?.saveAsSolution || "Save as solution"}
+                        </Button>
+                      </div>
+                    </>
+                  )}
+                </div>
+              )}
+
+              {customSolutions.length === 0 ? (
+                <p className="text-xs" style={{ color: getSecondaryTextColor() }}>
+                  {tr?.noCustomSolutions || "No custom solutions yet. Edit the file, save a version, then “New from version”."}
+                </p>
+              ) : (
+                <div className="grid gap-2">
+                  {customSolutions.map((sol) => {
+                    const isSelected = selectedSolutions.has(sol.id);
+                    const isUsed = sol.id in usedSolutions;
+                    return (
+                      <div
+                        key={sol.id}
+                        className={`flex items-center gap-3 p-3 rounded-lg border transition-all ${
+                          isUsed
+                            ? "opacity-60"
+                            : isSelected
+                              ? "bg-gradient-to-r from-red-500/20 to-orange-500/20 border-red-500/50"
+                              : getBgHover()
+                        }`}
+                        style={{ borderColor: isSelected && !isUsed ? undefined : getBorderColor() }}
+                      >
+                        <button
+                          onClick={() => !isUsed && toggleSolution(sol.id)}
+                          disabled={isUsed}
+                          className="flex items-center gap-3 flex-1 min-w-0 text-left disabled:cursor-not-allowed"
+                        >
+                          <div className="w-10 h-10 rounded-lg bg-gradient-to-br from-amber-500 to-orange-600 flex items-center justify-center flex-shrink-0">
+                            <Star className="w-5 h-5 text-white" />
+                          </div>
+                          <div className="flex-1 min-w-0">
+                            <h4 className="font-medium truncate" style={{ color: getTextColor() }}>{sol.name}</h4>
+                            <p className="text-xs truncate" style={{ color: getSecondaryTextColor() }}>
+                              {sol.byteCount} bytes{sol.ecuType ? ` · ${sol.ecuType}` : ""}{sol.description ? ` · ${sol.description}` : ""}
+                            </p>
+                          </div>
+                        </button>
+                        <div className="flex items-center gap-2 flex-shrink-0">
+                          {isUsed ? (
+                            <span className="flex items-center gap-1 text-xs px-2 py-1 rounded-full bg-blue-500/20 text-blue-400">
+                              <Check className="w-3 h-3" />
+                              {usedSolutions[sol.id]}
+                            </span>
+                          ) : (
+                            <div className={`w-6 h-6 rounded-full border-2 flex items-center justify-center ${isSelected ? "bg-red-500 border-red-500" : "border-slate-500"}`}>
+                              {isSelected && <Check className="w-4 h-4 text-white" />}
+                            </div>
+                          )}
+                          {onDeleteCustomSolution && (
+                            <button
+                              onClick={() => onDeleteCustomSolution(sol.id)}
+                              title={tr?.delete || "Delete"}
+                              className={`p-1.5 rounded-md ${getBgHover()}`}
+                              style={{ color: getSecondaryTextColor() }}
+                            >
+                              <Trash2 className="w-4 h-4" />
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
           </div>
 
           {/* Pied */}
-          {ecuConfig && (
+          {(ecuConfig || customSolutions.length > 0) && (
             <div
               className="p-4 border-t flex items-center justify-between"
               style={{ borderColor: getBorderColor() }}
