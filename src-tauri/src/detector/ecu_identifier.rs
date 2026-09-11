@@ -110,6 +110,15 @@ impl ECUIdentifier {
     /// files being misread as a supported ECU.
     const SUPPORTED_SIZES: [usize; 3] = [524_288, 1_048_576, 2_097_152];
 
+    /// Full-flash dump sizes of the newer Bosch families (EDC17 in particular).
+    /// EDC15/EDC16 are strictly SUPPORTED_SIZES; BMW EDC17 full reads are
+    /// commonly 2MB or 4MB. Identification for these families runs on this wider
+    /// set BEFORE the strict size gate, so a 4MB EDC17 dump is recognized (beta)
+    /// instead of being rejected for its size. Foreign files of these sizes still
+    /// fall through to Unknown — only the remap-stable "EDC17" / "MED17" family
+    /// string promotes a file here.
+    const NEWER_BOSCH_SIZES: [usize; 2] = [2_097_152, 4_194_304];
+
     /// Identify ECU from binary data using multiple detection methods.
     /// STRICT by design: a file is only identified as a supported ECU when it
     /// carries positive evidence (Bosch HW prefix, family strings, structural
@@ -117,6 +126,20 @@ impl ECUIdentifier {
     /// manufacturer must come back Unknown, not EDC16.
     pub fn identify(data: &[u8]) -> ECUIdentification {
         log::debug!("🔍 Starting ECU identification on {} bytes", data.len());
+
+        // Newer Bosch families (EDC17/MED17) ship larger dumps than the strict
+        // EDC15/EDC16 sizes — BMW EDC17 full reads are commonly 4MB. Identify
+        // them from their remap-stable family string BEFORE the size gate, on the
+        // wider NEWER_BOSCH_SIZES set, so a valid 4MB EDC17 dump is recognized
+        // (beta) instead of rejected for size. The text-file guard keeps a text
+        // file that merely mentions "EDC17" from being taken for a dump; foreign
+        // binaries of these sizes carry no such string and stay Unknown below.
+        if Self::NEWER_BOSCH_SIZES.contains(&data.len()) && !Self::is_text_file(data) {
+            if let Some(id) = Self::identify_unsupported_bosch(data) {
+                log::debug!("🚫 Unsupported Bosch family detected (pre-size): {:?}", id.ecu_type);
+                return id;
+            }
+        }
 
         // Quick validation: only the exact dump sizes of supported families
         if !Self::SUPPORTED_SIZES.contains(&data.len()) {
@@ -1250,7 +1273,7 @@ impl ECUIdentifier {
             None
         }
     }
-    
+
     fn contains_hex_pattern(data: &[u8], pattern: &[u8]) -> bool {
         Self::contains_sequence(data, pattern)
     }
@@ -1758,6 +1781,34 @@ mod tests {
         assert_eq!(id.ecu_type, ECUType::EDC17C);
         // Beta EDC17: the family token is pulled from the metadata for display.
         assert_eq!(id.variant.as_deref(), Some("EDC17C46"));
+    }
+
+    /// A 4MB BMW EDC17 full read (the common size) must be identified as EDC17,
+    /// not rejected by the strict EDC15/EDC16 size gate. The family string sits
+    /// deep in the flash (as on real BMW dumps), so this also covers the
+    /// whole-file scan for the token.
+    #[test]
+    fn test_edc17_4mb_bmw_is_identified() {
+        let mut data = vec![0xFFu8; 4_194_304];
+        data[0x1012A5..0x1012B2].copy_from_slice(b"EDC17_C50_C56");
+        let id = ECUIdentifier::identify(&data);
+        assert_eq!(id.ecu_type, ECUType::EDC17C, "4MB BMW EDC17 must be EDC17C, got {:?}", id.ecu_type);
+        assert_eq!(id.variant.as_deref(), Some("EDC17_C50_C56"));
+    }
+
+    /// A foreign 4MB file (no EDC17/MED17 family string) must stay Unknown: the
+    /// wider NEWER_BOSCH_SIZES pre-gate only promotes files that carry the string,
+    /// everything else still falls through the strict size gate.
+    #[test]
+    fn test_foreign_4mb_file_is_unknown() {
+        let mut data = vec![0u8; 4_194_304];
+        let mut x: u32 = 0xCAFEBABE;
+        for b in data.iter_mut() {
+            x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+            *b = (x >> 24) as u8;
+        }
+        let id = ECUIdentifier::identify(&data);
+        assert_eq!(id.ecu_type, ECUType::Unknown, "foreign 4MB file must be Unknown, got {:?}", id.ecu_type);
     }
 
     #[test]
