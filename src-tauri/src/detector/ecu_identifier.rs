@@ -220,15 +220,25 @@ impl ECUIdentifier {
     /// unsupported (no beta scan target requested).
     fn identify_unsupported_bosch(data: &[u8]) -> Option<ECUIdentification> {
         if let Some(pos) = Self::find_sequence(data, b"EDC17") {
-            let variant =
+            let token =
                 Self::extract_ascii_token(data, pos, 24).unwrap_or_else(|| "EDC17".to_string());
+            // Enrich with the remap-stable VAG/Bosch metadata numbers when
+            // present (e.g. VAG EDC17C64 on Audi: "…906…" part + "0281…" HW).
+            // These only LABEL an already-identified EDC17 file — the family
+            // string above is the sole identification anchor — so they can never
+            // misidentify a foreign file, and their absence is harmless.
+            let vag_part = Self::find_vag_906_part(data);
+            let variant = match &vag_part {
+                Some(p) => format!("{} (VAG {})", token, p),
+                None => token,
+            };
             return Some(ECUIdentification {
                 manufacturer: ECUManufacturer::Bosch,
                 ecu_type: ECUType::EDC17C,
                 variant: Some(variant),
                 software_version: None,
-                hardware_version: None,
-                part_number: None,
+                hardware_version: Self::find_bosch_diesel_hw(data),
+                part_number: vag_part,
                 confidence: 0.85,
             });
         }
@@ -1274,6 +1284,53 @@ impl ECUIdentifier {
         }
     }
 
+    /// Whole-file scan for a Bosch diesel hardware number: "0281" followed by
+    /// six ASCII digits (e.g. "0281030529"). Unlike `extract_bosch_hw_number`,
+    /// which looks in the EDC15/EDC16 metadata zones, this scans the whole file
+    /// because EDC17 stores the number deep in the flash. It is metadata, not
+    /// tuning data, so it survives a remap. Used only to enrich an already
+    /// identified EDC17 file — never to decide identification.
+    fn find_bosch_diesel_hw(data: &[u8]) -> Option<String> {
+        let mut i = 0usize;
+        while i + 10 <= data.len() {
+            if &data[i..i + 4] == b"0281" && data[i + 4..i + 10].iter().all(u8::is_ascii_digit) {
+                return std::str::from_utf8(&data[i..i + 10]).ok().map(str::to_string);
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// Whole-file scan for a VAG "906" software/part number in compact form:
+    /// '0', two alphanumerics, "906", three digits, optional trailing uppercase
+    /// letter (e.g. "03L906056Q", "059906018"). The "906" group is the VAG
+    /// ECU-software marker; it is written in the metadata and survives a remap.
+    /// Used only to enrich/label an already identified EDC17 file (VAG tag), not
+    /// to identify one — the part-number conventions overlap other families.
+    fn find_vag_906_part(data: &[u8]) -> Option<String> {
+        let is_an = |b: u8| b.is_ascii_uppercase() || b.is_ascii_digit();
+        let mut i = 0usize;
+        while i + 9 <= data.len() {
+            if data[i] == b'0'
+                && is_an(data[i + 1])
+                && is_an(data[i + 2])
+                && &data[i + 3..i + 6] == b"906"
+                && data[i + 6..i + 9].iter().all(u8::is_ascii_digit)
+            {
+                let mut s = match std::str::from_utf8(&data[i..i + 9]) {
+                    Ok(t) => t.to_string(),
+                    Err(_) => return None,
+                };
+                if i + 9 < data.len() && data[i + 9].is_ascii_uppercase() {
+                    s.push(data[i + 9] as char);
+                }
+                return Some(s);
+            }
+            i += 1;
+        }
+        None
+    }
+
     fn contains_hex_pattern(data: &[u8], pattern: &[u8]) -> bool {
         Self::contains_sequence(data, pattern)
     }
@@ -1809,6 +1866,22 @@ mod tests {
         }
         let id = ECUIdentifier::identify(&data);
         assert_eq!(id.ecu_type, ECUType::Unknown, "foreign 4MB file must be Unknown, got {:?}", id.ecu_type);
+    }
+
+    /// A VAG EDC17C64 dump (Audi target: 4MB, EDC17C64 family string plus a VAG
+    /// "…906…" part number and a Bosch "0281…" HW number) must be identified as
+    /// EDC17C beta, tagged VAG, with the part/HW numbers surfaced for display.
+    #[test]
+    fn test_edc17c64_vag_audi_is_identified() {
+        let mut data = vec![0xFFu8; 4_194_304];
+        data[0x1000..0x1008].copy_from_slice(b"EDC17C64");
+        data[0x2000..0x200A].copy_from_slice(b"0281030529"); // Bosch diesel HW
+        data[0x3000..0x300A].copy_from_slice(b"03L906056Q"); // VAG 906 part number
+        let id = ECUIdentifier::identify(&data);
+        assert_eq!(id.ecu_type, ECUType::EDC17C, "VAG EDC17C64 must be EDC17C, got {:?}", id.ecu_type);
+        assert_eq!(id.variant.as_deref(), Some("EDC17C64 (VAG 03L906056Q)"));
+        assert_eq!(id.part_number.as_deref(), Some("03L906056Q"));
+        assert_eq!(id.hardware_version.as_deref(), Some("0281030529"));
     }
 
     #[test]
